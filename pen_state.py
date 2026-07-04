@@ -1,8 +1,9 @@
-"""抬笔 / 落笔判定。
+"""Pen up/down detection.
 
-推荐方案：基于 Z 高度的双阈值迟滞（hysteresis）。
-手压低（z 小）落笔画线，抬高（z 大）移动不画；中间区间保持上一状态，避免抖动。
-若轨迹自带显式 pen 列，则直接采用。
+Recommended approach: dual-threshold hysteresis on Z height.
+Hand low (small z) = pen down and drawing; hand high (large z) = moving without drawing;
+in between, keep the previous state to avoid jitter.
+If the trajectory carries an explicit pen column, use it directly.
 """
 from __future__ import annotations
 
@@ -16,10 +17,10 @@ def pen_from_z(
     min_run: int = 2,
     z_is_height: bool = True,
 ) -> np.ndarray:
-    """由 z 高度推断每个采样点是否落笔（True=落笔）。
+    """Infer pen-down state for each sample from z height (True=down).
 
-    z_is_height=True 表示 z 越小手越靠近面板（落笔）。
-    down_thresh < up_thresh 形成迟滞带。min_run 用于过滤过短的状态翻转。
+    z_is_height=True means smaller z = hand closer to the panel (pen down).
+    down_thresh < up_thresh forms a hysteresis band. min_run filters out overly short state flips.
     """
     z = np.asarray(z, dtype=np.float64)
     n = len(z)
@@ -46,7 +47,7 @@ def pen_from_z(
 
 
 def _debounce(pen: np.ndarray, min_run: int) -> np.ndarray:
-    """剔除长度小于 min_run 的连续段，避免毛刺式的抬落笔。"""
+    """Remove runs shorter than min_run to avoid glitchy pen up/down flips."""
     if min_run <= 1 or len(pen) == 0:
         return pen
     out = pen.copy()
@@ -60,7 +61,7 @@ def _debounce(pen: np.ndarray, min_run: int) -> np.ndarray:
 
 
 def resolve_pen(traj) -> np.ndarray:
-    """优先使用显式 pen 列，否则用 z 推断，再否则全部视为落笔。"""
+    """Use the explicit pen column first; else infer from z; else treat everything as pen down."""
     if traj.pen is not None and not np.all(np.isnan(traj.pen)):
         return np.nan_to_num(traj.pen, nan=0.0) > 0.5
     if traj.z is not None and not np.all(np.isnan(traj.z)):

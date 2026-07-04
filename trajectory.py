@@ -1,12 +1,14 @@
-"""轨迹数据的读写与数据结构。
+"""Trajectory data structures and CSV I/O.
 
-原始轨迹以 CSV 存储，列至少包含: t, x, y；可选 z, pen, in_range。
-- t        时间戳（秒）
-- x, y     归一化坐标（Skywriter 给的 0~1，手不在感应区时可为空/NaN）
-- z        手到面板的高度（0~1）；实测 Skywriter 的 z 容易饱和，不建议单独当抬落笔阈值
-- pen      可选：显式抬笔/落笔标记（1=落笔，0=抬笔），有则优先使用
-- in_range 可选：手是否在感应区（1=在=落笔，0=离开=抬笔）。采集脚本输出此列，
-           比 z 阈值更可靠，载入时会作为 pen 使用
+Raw trajectories are stored as CSV with at least: t, x, y; optional z, pen, in_range.
+- t        timestamp (seconds)
+- x, y     normalized coordinates (0~1 from the Skywriter; may be empty/NaN when the hand is out of range)
+- z        hand height above the panel (0~1); in practice the Skywriter z saturates easily,
+           so it is not recommended as the sole pen up/down threshold
+- pen      optional: explicit pen up/down flag (1=down, 0=up); used first if present
+- in_range optional: whether the hand is in the sensing area (1=in=down, 0=out=up).
+           The capture script writes this column; it is more reliable than a z threshold
+           and is used as pen when loading
 """
 from __future__ import annotations
 
@@ -39,7 +41,7 @@ def load_trajectory(path: str) -> Trajectory:
             cols[n] = []
         for row in reader:
             for raw_key, val in row.items():
-                if raw_key is None:      # 某行比表头多出的列，丢弃
+                if raw_key is None:      # row has more columns than the header, drop them
                     continue
                 key = raw_key.strip().lower()
                 if key not in cols:
@@ -56,7 +58,7 @@ def load_trajectory(path: str) -> Trajectory:
     t = arr("t")
     if t is None:
         t = np.arange(n, dtype=np.float64)
-    # 优先用显式 pen 列；没有则用 in_range（手在不在感应区）当抬笔/落笔依据
+    # Prefer the explicit pen column; otherwise use in_range (hand in sensing area) for pen up/down
     pen = arr("pen")
     if pen is None:
         pen = arr("in_range")

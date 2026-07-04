@@ -1,31 +1,32 @@
-"""实时滤波链(纯标准库,树莓派/电脑通用)。
+"""Real-time filter chain (stdlib only, works on both the Pi and the desktop).
 
-web_capture.py / draw_app.py / denoise.py 共用,避免同一份滤波代码复制三遍、
-参数各自漂移。部署到树莓派时把本文件和 mgc3130.py 一起拷过去。
+Shared by web_capture.py / draw_app.py / denoise.py so the same filter code
+isn't copied three times with parameters drifting apart. When deploying to the
+Pi, copy this file together with mgc3130.py.
 
-链路: 3 点中值(MedianWin) -> 尖刺门控(SpikeGate) -> 1€ 平滑(OneEuro)
-抬落笔: ZPenHysteresis(双阈值迟滞 + 连续帧去抖)
+Chain: 3-point median (MedianWin) -> spike gate (SpikeGate) -> 1€ smoothing (OneEuro)
+Pen up/down: ZPenHysteresis (dual-threshold hysteresis + consecutive-frame debounce)
 """
 from __future__ import annotations
 
 import math
 from collections import deque
 
-# ---- 实测调好的一组默认参数(web_capture 上标定,draw_app 直接沿用) ----
+# ---- Defaults tuned on real data (calibrated in web_capture, reused by draw_app) ----
 MEDIAN_WIN = 3
-SPIKE_MULT = 8.0          # 跳变 > mult×近期步长中位数 => 丢弃该帧
-SPIKE_FLOOR = 0.002       # 正常画圆 p95 步长约 0.004；floor 过高会误杀跟手点
+SPIKE_MULT = 8.0          # jump > mult x recent median step => drop the frame
+SPIKE_FLOOR = 0.002       # p95 step while drawing a circle is ~0.004; too high a floor kills tracking points
 SPIKE_WIN = 24
-ONE_EURO_MINCUTOFF = 1.0  # 比 1.8 跟手；配合 beta 抑制画圆滞后
+ONE_EURO_MINCUTOFF = 1.0  # tracks better than 1.8; combined with beta suppresses circle lag
 ONE_EURO_BETA = 0.045
 ONE_EURO_DCUTOFF = 1.0
-Z_PEN_DOWN = 0.26         # z 低于它(连续 PEN_MIN_FRAMES 帧)落笔
-Z_PEN_UP = 0.32           # z 高于它(连续 PEN_MIN_FRAMES 帧)抬笔；中间保持原状态
+Z_PEN_DOWN = 0.26         # pen down when z stays below this for PEN_MIN_FRAMES frames
+Z_PEN_UP = 0.32           # pen up when z stays above this; in between keep previous state
 PEN_MIN_FRAMES = 2
 
 
 class MedianWin:
-    """滑动中值，去掉单帧尖刺。"""
+    """Sliding median, removes single-frame spikes."""
 
     def __init__(self, win=MEDIAN_WIN):
         self.xs = deque(maxlen=win)
@@ -44,11 +45,12 @@ class MedianWin:
 
 
 class SpikeGate:
-    """自适应尖刺门控：相对近期步长中位数的异常跳变直接丢弃。
+    """Adaptive spike gate: drop jumps that are abnormal relative to the recent median step.
 
-    只丢弃孤立尖刺：连续 max_reject 帧都超限说明是真实的快速移动，
-    此时接受新位置重新锚定。否则锚点永远停在旧位置、之后每帧距离
-    只增不减，门控会卡死（画面冻结在一个点）。
+    Only isolated spikes are dropped: max_reject consecutive over-limit frames
+    mean genuine fast movement, so accept the new position and re-anchor.
+    Otherwise the anchor stays at the old position forever, the per-frame
+    distance only grows, and the gate locks up (cursor frozen at one point).
     """
 
     def __init__(self, mult=SPIKE_MULT, floor=SPIKE_FLOOR, win=SPIKE_WIN,
@@ -77,7 +79,7 @@ class SpikeGate:
             self._rej += 1
             if self._rej < self.max_reject:
                 return self.x, self.y
-            # 连续超限：按真实移动重新锚定（这一大步不计入步长统计）
+            # consecutive over-limit: treat as real movement and re-anchor (big step not added to stats)
             self._rej = 0
             self.x, self.y = x, y
             return x, y
@@ -88,10 +90,11 @@ class SpikeGate:
 
 
 class OneEuro:
-    """1€ 滤波（Casiez et al.）：慢动作稳、快动作低延迟。
+    """1€ filter (Casiez et al.): stable when slow, low latency when fast.
 
-    __call__(x, t) 传时间戳则按真实 dt 自适应；t=None 时退化为固定 freq。
-    mincutoff 可逐次调用覆盖（如按 z 高度动态加强平滑）。
+    __call__(x, t) adapts to real dt when a timestamp is given; t=None falls
+    back to fixed freq. mincutoff can be overridden per call (e.g. stronger
+    smoothing depending on z height).
     """
 
     def __init__(self, mincutoff=ONE_EURO_MINCUTOFF, beta=ONE_EURO_BETA,
@@ -139,11 +142,13 @@ class OneEuro:
 
 
 class ZPenHysteresis:
-    """z 高度抬落笔：双阈值迟滞 + 连续帧去抖。
+    """Pen up/down from z height: dual-threshold hysteresis + consecutive-frame debounce.
 
-    单阈值的问题：手悬在临界高度时 z 的噪声让 pen 在 0/1 间抖动，一笔断成碎段。
-    这里 z < down 连续 min_frames 帧才落笔，z > up 连续 min_frames 帧才抬笔，
-    中间区间保持原状态（与离线端 pen_state.pen_from_z 同思路的实时版）。
+    With a single threshold, z noise while the hand hovers at the critical
+    height makes pen flip between 0/1 and one stroke shatters into fragments.
+    Here pen goes down only after z < down for min_frames consecutive frames,
+    and up only after z > up for min_frames frames; in between the previous
+    state is kept (real-time version of pen_state.pen_from_z).
     """
 
     def __init__(self, down=Z_PEN_DOWN, up=Z_PEN_UP, min_frames=PEN_MIN_FRAMES):

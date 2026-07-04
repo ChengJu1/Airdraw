@@ -1,55 +1,55 @@
-# Skywriter 轨迹预处理（降噪 + 提取）
+# Skywriter trajectory preprocessing (denoise + extract)
 
-毕业设计 pipeline 的**第一步**：把 Skywriter（MGC3130）采集的空中手绘轨迹做**降噪**与**提取**，输出规整后的笔画与 Sketch-RNN 所需的 **stroke-3** 格式，供后续重建阶段使用。
+**First stage** of the final-year project pipeline: take air-drawn trajectories captured by the Skywriter (MGC3130), apply **denoising** and **extraction**, and output normalized strokes plus the **stroke-3** format required by Sketch-RNN for the later reconstruction stage.
 
 ```
-原始 (t, x, y, z) → 抬笔/落笔判定 → 降噪 → 分段/重采样/归一化 → stroke-3
+raw (t, x, y, z) → pen up/down detection → denoise → segment/resample/normalize → stroke-3
 ```
 
-## 模块
+## Modules
 
-| 文件 | 作用 |
+| File | Purpose |
 |------|------|
-| `trajectory.py` | 轨迹数据结构 + CSV 读写 |
-| `pen_state.py`  | 抬笔/落笔判定（Z 高度双阈值迟滞；支持显式 pen 列） |
-| `denoise.py`    | 离群跳点剔除 + 1€ 滤波平滑（实时友好） |
-| `extract.py`    | 分段、弧长等间距重采样、归一化、转 stroke-3 |
-| `visualize.py`  | 三联图：原始 / 降噪+落笔 / 提取笔画 |
-| `demo.py`       | 模拟数据跑通全流程，或读入真实 CSV |
-| `rt_filters.py` | 实时滤波链（中值/尖刺门控/1€/z 迟滞抬落笔），树莓派与离线端共用 |
-| `mgc3130.py`    | MGC3130 传感器 I2C 读取，三个树莓派脚本共用（部署时随脚本一起拷） |
+| `trajectory.py` | Trajectory data structure + CSV I/O |
+| `pen_state.py`  | Pen up/down detection (dual-threshold hysteresis on Z height; supports explicit pen column) |
+| `denoise.py`    | Outlier removal + 1€ filter smoothing (real-time friendly) |
+| `extract.py`    | Segmentation, equal arc-length resampling, normalization, stroke-3 conversion |
+| `visualize.py`  | Three-panel plot: raw / denoised+pen-down / extracted strokes |
+| `demo.py`       | Run the full pipeline on synthetic data, or load a real CSV |
+| `rt_filters.py` | Real-time filter chain (median / spike gate / 1€ / z hysteresis pen up/down), shared by the Raspberry Pi and the offline side |
+| `mgc3130.py`    | MGC3130 sensor I2C reader, shared by the three Raspberry Pi scripts (copy along with the scripts when deploying) |
 
-## 抬笔 / 落笔方案
+## Pen up/down scheme
 
-默认用 **Z 高度双阈值迟滞**：手压低（z 小）落笔，抬高（z 大）抬笔；落笔阈值 `0.30`、抬笔阈值 `0.45`，中间区间保持上一状态以防抖动。可在 `pen_state.pen_from_z()` 调整阈值，或改用 `z_is_height=False`。
-若采集时已有显式落笔标记，在 CSV 里加一列 `pen`（1=落笔，0=抬笔），会被优先使用。
+Default is **dual-threshold hysteresis on Z height**: hand low (small z) = pen down, hand high (large z) = pen up; down threshold `0.30`, up threshold `0.45`, and the in-between band keeps the previous state to avoid jitter. Thresholds can be adjusted in `pen_state.pen_from_z()`, or set `z_is_height=False`.
+If the capture already carries an explicit pen-down flag, add a `pen` column to the CSV (1=down, 0=up); it takes priority.
 
-## 使用
+## Usage
 
 ```bash
-pip install -r requirements.txt      # 电脑端(离线管线)
-# 树莓派端: pip install -r requirements_pi.txt(见该文件头部的部署说明)
+pip install -r requirements.txt      # PC side (offline pipeline)
+# Raspberry Pi side: pip install -r requirements_pi.txt (see deployment notes at the top of that file)
 
-# 1) 用模拟数据跑通（会生成 data/synthetic.csv 和 out/ 下的结果）
+# 1) Run with synthetic data (generates data/synthetic.csv and results under out/)
 python demo.py
 
-# 2) 用真实采集数据（CSV 至少含 t,x,y，可选 z,pen）
+# 2) Run with real capture data (CSV needs at least t,x,y; optional z,pen)
 python demo.py data/your_capture.csv
 ```
 
-输出：
-- `out/<name>_pipeline.png`：降噪与提取效果三联图
-- `out/<name>_stroke3.npy`：stroke-3 序列（下一步喂给 Sketch-RNN）
+Outputs:
+- `out/<name>_pipeline.png`: three-panel plot of denoising and extraction results
+- `out/<name>_stroke3.npy`: stroke-3 sequence (fed to Sketch-RNN in the next stage)
 
-## CSV 格式
+## CSV format
 
-| 列 | 含义 |
+| Column | Meaning |
 |----|------|
-| `t` | 时间戳（秒），缺省按帧序 |
-| `x`, `y` | 归一化坐标 0~1（手不在感应区可留空） |
-| `z` | 手到面板高度 0~1（用于抬笔/落笔），可选 |
-| `pen` | 显式落笔标记 1/0，可选（优先于 z） |
+| `t` | timestamp (seconds), defaults to frame index if absent |
+| `x`, `y` | normalized coordinates 0~1 (may be empty when the hand is out of range) |
+| `z` | hand height above the panel 0~1 (for pen up/down), optional |
+| `pen` | explicit pen-down flag 1/0, optional (takes priority over z) |
 
-## 下一步
+## Next step
 
-stroke-3 序列将作为 Sketch-RNN 的输入，进入**降噪重建**阶段（pipeline 第二步）。
+The stroke-3 sequence will be fed into Sketch-RNN for the **denoising reconstruction** stage (second stage of the pipeline).

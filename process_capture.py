@@ -1,9 +1,10 @@
-"""离线自动处理一段 Skywriter 采集 CSV：剔饱和 -> 跳变断笔分段 -> 逐笔 1€ 平滑
--> 稳健归一化 -> stroke-3，并输出「原始 vs 清理后」对比图。
+"""Offline automatic processing of a Skywriter capture CSV: drop saturation -> segment on
+jumps -> per-stroke 1€ smoothing -> robust normalization -> stroke-3, and output a
+"raw vs cleaned" comparison plot.
 
-用法:
+Usage:
     python process_capture.py cap_xxx.csv
-全自动，无需手调范围/方向。
+Fully automatic, no manual range/orientation tuning needed.
 """
 from __future__ import annotations
 
@@ -19,20 +20,20 @@ from trajectory import load_trajectory
 from denoise import smooth_xy
 from extract import resample_stroke, normalize_strokes, to_stroke3
 
-# ---- 参数（依据数据分布自动设的稳健默认） ----
-SAT_EPS = 0.003        # 贴近 0/1 这么近视为饱和点，剔除
-Z_MAX = 0.6            # 手抬太高(z>此值)位置失真，剔除这些点(1.0=不剔)
-JUMP_BREAK = 0.025     # 相邻保留点跳变超过它 => 断笔(正常移动 ~0.003，快速移动/引线更大)
-MIN_PTS = 8            # 一笔少于这么多点丢弃(碎屑)
-RESAMPLE = 3.0         # 重采样点间距(归一化坐标)
+# ---- Parameters (robust defaults set from the data distribution) ----
+SAT_EPS = 0.003        # points this close to 0/1 are treated as saturated and dropped
+Z_MAX = 0.6            # hand too high (z>this) distorts position, drop these points (1.0=keep all)
+JUMP_BREAK = 0.025     # jump between adjacent kept points above this => break stroke (normal motion ~0.003, fast moves/lead-ins larger)
+MIN_PTS = 8            # strokes with fewer points are dropped (debris)
+RESAMPLE = 3.0         # resampling point spacing (normalized coordinates)
 SMOOTH_MINCUTOFF = 1.0
 SMOOTH_BETA = 0.045
-FLIP_Y = True          # 传感器 y 向上、绘图 y 向下，翻转以符合直觉
-STITCH = False         # 识别用：保留原始多笔布局，不缝合(缝合会把分散笔画连成穿越线)
+FLIP_Y = True          # sensor y points up, plot y points down; flip for intuition
+STITCH = False         # for recognition: keep original multi-stroke layout, no stitching (stitching connects scattered strokes with crossing lines)
 
 
 def segment(t, x, y, pen, jump_break, min_pts):
-    """按抬笔/跳变分段，每笔保留 (t, x, y) 三列，时间戳供 1€ 滤波用。"""
+    """Segment on pen-up/jumps; each stroke keeps (t, x, y), timestamps for the 1€ filter."""
     strokes, cur, last = [], [], None
     for i in range(len(x)):
         if pen[i]:
@@ -53,13 +54,13 @@ def segment(t, x, y, pen, jump_break, min_pts):
 
 
 def smooth_stroke(s):
-    """s: (N,3) 的 t,x,y。用 CSV 里的真实时间戳跑 1€，采样率波动时更准。"""
+    """s: (N,3) of t,x,y. Run 1€ with the real CSV timestamps, more accurate when the sample rate fluctuates."""
     sx, sy = smooth_xy(s[:, 0], s[:, 1], s[:, 2], SMOOTH_MINCUTOFF, SMOOTH_BETA)
     return np.stack([sx, sy], axis=1)
 
 
 def stitch_strokes(strokes):
-    """把每一笔平移，使其起点接到上一笔的终点 => 连成连续的一笔画。"""
+    """Translate each stroke so its start joins the previous stroke's end => one continuous line."""
     if not strokes:
         return []
     out = [strokes[0]]
@@ -72,7 +73,7 @@ def stitch_strokes(strokes):
 def main(path):
     tr = load_trajectory(path)
     x, y = tr.x.copy(), tr.y.copy()
-    inr = tr.pen  # 旧格式里 in_range 被当作 pen 载入
+    inr = tr.pen  # in the old format, in_range is loaded as pen
     n = len(x)
 
     valid = ~(np.isnan(x) | np.isnan(y))
@@ -80,7 +81,7 @@ def main(path):
         valid = valid & (np.nan_to_num(inr) > 0.5)
     sat = (x <= SAT_EPS) | (x >= 1 - SAT_EPS) | (y <= SAT_EPS) | (y >= 1 - SAT_EPS)
     if tr.z is not None:
-        sat = sat | (np.nan_to_num(tr.z) > Z_MAX)   # 手抬太高 => 位置失真，按饱和剔除
+        sat = sat | (np.nan_to_num(tr.z) > Z_MAX)   # hand too high => position distorted, drop as saturated
     pen = valid & (~sat)
 
     strokes_raw = segment(tr.t, x, y, pen, JUMP_BREAK, MIN_PTS)
@@ -88,11 +89,11 @@ def main(path):
     strokes_norm = normalize_strokes(strokes_sm, target_size=255.0)
     strokes_rs = [resample_stroke(s, RESAMPLE) for s in strokes_norm]
 
-    # 缝合成一笔画（忽略抬笔期间的位移）
+    # Stitch into a single stroke (ignore displacement during pen-up)
     stitched = stitch_strokes(strokes_rs)
     single = [np.concatenate(stitched, axis=0)] if stitched else []
 
-    # 用于 Sketch-RNN 的 stroke-3：缝合后为单笔连续，否则保留分段
+    # stroke-3 for Sketch-RNN: single continuous stroke if stitched, otherwise keep segments
     stroke3 = to_stroke3(single if STITCH else strokes_rs)
 
     base = os.path.splitext(os.path.basename(path))[0]
@@ -101,7 +102,7 @@ def main(path):
     out_npy = os.path.join("out", base + "_stroke3.npy")
     np.save(out_npy, stroke3)
 
-    # ---- 可视化：原始 / 清理分段 / 缝合成一笔 ----
+    # ---- Visualization: raw / cleaned segments / stitched single stroke ----
     fig, axes = plt.subplots(1, 3, figsize=(15, 5.2))
     yf = (lambda a: -a) if FLIP_Y else (lambda a: a)
 
@@ -130,17 +131,17 @@ def main(path):
     fig.savefig(out_png, dpi=110)
     plt.close(fig)
 
-    print("总帧:            %d" % n)
-    print("有效(在感应区):  %d" % int(valid.sum()))
-    print("饱和点占比:      %.1f%%" % (np.mean(sat[valid]) * 100 if valid.any() else 0))
-    print("分出笔画:        %d 笔" % len(strokes_rs))
-    print("stroke-3 步数:   %d" % len(stroke3))
-    print("对比图已保存:    %s" % out_png)
-    print("stroke-3 已保存: %s" % out_npy)
+    print("total frames:    %d" % n)
+    print("valid (in range):%d" % int(valid.sum()))
+    print("saturated ratio: %.1f%%" % (np.mean(sat[valid]) * 100 if valid.any() else 0))
+    print("strokes:         %d" % len(strokes_rs))
+    print("stroke-3 steps:  %d" % len(stroke3))
+    print("plot saved:      %s" % out_png)
+    print("stroke-3 saved:  %s" % out_npy)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python process_capture.py <capture.csv>")
+        print("Usage: python process_capture.py <capture.csv>")
         sys.exit(1)
     main(sys.argv[1])

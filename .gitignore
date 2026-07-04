@@ -1,15 +1,16 @@
-# 本地密钥
+# local API keys
 key_local.py
 
-# 输出与采集
+# outputs and captures
 out/
 captures/
 *.csv
 !data/synthetic.csv
 *.png
 
-# 编辑器 / 工具
+# editor / tooling
 .claude/
+.tmp_versions/
 .venv/
 __pycache__/
 *.pyc

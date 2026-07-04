@@ -1,9 +1,11 @@
-"""轨迹降噪。
+"""Trajectory denoising.
 
-两步：
-1. 离群跳点剔除：相邻点位移远大于中位位移的点视为噪点，用线性插值修补。
-2. 1€ 滤波（One Euro Filter）：实时友好的低延迟平滑，兼顾抖动抑制与跟手性。
-   参考 Casiez et al., "1€ Filter: A Simple Speed-based Low-pass Filter"。
+Two steps:
+1. Outlier removal: points whose displacement to neighbors is far above the median
+   displacement are treated as noise and repaired by linear interpolation.
+2. 1€ filter (One Euro Filter): real-time friendly low-latency smoothing that balances
+   jitter suppression and responsiveness.
+   See Casiez et al., "1€ Filter: A Simple Speed-based Low-pass Filter".
 """
 from __future__ import annotations
 
@@ -11,11 +13,11 @@ import math
 
 import numpy as np
 
-from rt_filters import OneEuro, SpikeGate  # noqa: F401  与实时端共用同一实现
+from rt_filters import OneEuro, SpikeGate  # noqa: F401  shared implementation with the real-time side
 
 
 def remove_outliers(x: np.ndarray, y: np.ndarray, max_jump_factor: float = 5.0):
-    """剔除位移异常的跳点并插值修补。返回修补后的 (x, y)。"""
+    """Remove jump points with abnormal displacement and repair by interpolation. Returns repaired (x, y)."""
     x = x.astype(np.float64).copy()
     y = y.astype(np.float64).copy()
     n = len(x)
@@ -51,9 +53,10 @@ def _interp_nan(a: np.ndarray) -> np.ndarray:
 
 
 def median_win(x: np.ndarray, y: np.ndarray, win: int = 3):
-    """居中滑动中值，去掉单帧尖刺。
+    """Centered sliding median, removes single-frame spikes.
 
-    离线用居中窗口，无相位滞后（实时端只能看过去，用 rt_filters.MedianWin 的拖尾版）。
+    Offline uses a centered window with no phase lag (the real-time side can only see
+    the past and uses the trailing version in rt_filters.MedianWin).
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -70,7 +73,7 @@ def median_win(x: np.ndarray, y: np.ndarray, win: int = 3):
 
 def smooth_xy(t: np.ndarray, x: np.ndarray, y: np.ndarray,
               mincutoff: float = 1.0, beta: float = 0.007):
-    """对 x、y 各跑一路 1€ 滤波（实现见 rt_filters.OneEuro）。t=None 按 30Hz 处理。"""
+    """Run one 1€ filter each on x and y (implementation in rt_filters.OneEuro). t=None assumes 30Hz."""
     fx = OneEuro(mincutoff=mincutoff, beta=beta)
     fy = OneEuro(mincutoff=mincutoff, beta=beta)
     sx = np.empty_like(x, dtype=np.float64)
@@ -84,7 +87,7 @@ def smooth_xy(t: np.ndarray, x: np.ndarray, y: np.ndarray,
 
 def denoise(traj, mincutoff: float = 1.0, beta: float = 0.045,
             max_jump_factor: float = 5.0, spike_mult: float = 8.0):
-    """完整降噪：中值 -> 尖刺门控 -> 剔跳点 -> 1€ 平滑。返回平滑后的 (x, y)。"""
+    """Full denoising: median -> spike gate -> outlier removal -> 1€ smoothing. Returns smoothed (x, y)."""
     x, y = median_win(traj.x, traj.y, win=3)
     gate = SpikeGate(mult=spike_mult)
     sx, sy = [], []

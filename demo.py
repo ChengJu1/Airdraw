@@ -1,8 +1,8 @@
-"""用模拟数据跑通 降噪 + 提取 全流程，并输出可视化与 stroke-3。
+"""Run the full denoise + extract pipeline on synthetic data, output visualization and stroke-3.
 
-真实数据接入：把 Skywriter 录制的 CSV 放到 data/ 下，运行：
+For real data: put a Skywriter-recorded CSV under data/ and run:
     python demo.py data/your_capture.csv
-CSV 至少含 t,x,y（可选 z, pen）。
+The CSV needs at least t,x,y (optional z, pen).
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from visualize import plot_pipeline
 
 
 def make_synthetic(seed: int = 0) -> Trajectory:
-    """生成一条带噪声、含抬笔/落笔的模拟轨迹：一个方框 + 一条斜线。"""
+    """Generate a noisy synthetic trajectory with pen up/down: a square plus a diagonal line."""
     rng = np.random.default_rng(seed)
     segments = []  # (points, pen_down)
 
@@ -32,8 +32,8 @@ def make_synthetic(seed: int = 0) -> Trajectory:
               ((0.7, 0.7), (0.3, 0.7)), ((0.3, 0.7), (0.3, 0.3))]
     for a, b in square:
         segments.append((line(a, b, 25), True))
-    segments.append((line((0.3, 0.3), (0.45, 0.45), 12), False))  # 抬笔移动
-    segments.append((line((0.45, 0.45), (0.6, 0.6), 20), True))    # 第二笔
+    segments.append((line((0.3, 0.3), (0.45, 0.45), 12), False))  # pen-up move
+    segments.append((line((0.45, 0.45), (0.6, 0.6), 20), True))    # second stroke
 
     xs, ys, zs, pens = [], [], [], []
     for pts, down in segments:
@@ -46,7 +46,7 @@ def make_synthetic(seed: int = 0) -> Trajectory:
 
     x = np.asarray(xs)
     y = np.asarray(ys)
-    # 注入几个离群跳点
+    # Inject a few outlier jump points
     for idx in rng.choice(len(x), size=4, replace=False):
         x[idx] += rng.normal(0, 0.15)
         y[idx] += rng.normal(0, 0.15)
@@ -64,12 +64,12 @@ def run(traj: Trajectory, out_prefix: str) -> None:
                         out_path=out_prefix + "_pipeline.png")
     np.save(out_prefix + "_stroke3.npy", stroke3)
 
-    print(f"采样点数:        {len(traj)}")
-    print(f"落笔点数:        {int(np.sum(pen_down))}")
-    print(f"提取笔画数:      {len(strokes)}")
-    print(f"stroke-3 步数:   {len(stroke3)}")
-    print(f"可视化已保存:    {img}")
-    print(f"stroke-3 已保存: {out_prefix}_stroke3.npy")
+    print(f"samples:         {len(traj)}")
+    print(f"pen-down points: {int(np.sum(pen_down))}")
+    print(f"strokes:         {len(strokes)}")
+    print(f"stroke-3 steps:  {len(stroke3)}")
+    print(f"plot saved:      {img}")
+    print(f"stroke-3 saved:  {out_prefix}_stroke3.npy")
 
 
 if __name__ == "__main__":
@@ -82,5 +82,5 @@ if __name__ == "__main__":
         os.makedirs("data", exist_ok=True)
         save_trajectory("data/synthetic.csv", traj)
         prefix = os.path.join("out", "synthetic")
-        print("未提供数据文件，使用模拟轨迹（已存到 data/synthetic.csv）。\n")
+        print("No data file given, using synthetic trajectory (saved to data/synthetic.csv).\n")
     run(traj, prefix)

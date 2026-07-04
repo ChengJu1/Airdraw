@@ -1,8 +1,11 @@
-"""轨迹提取与规整。
+"""Trajectory extraction and normalization.
 
-流程：按抬笔/落笔分段 -> 整体归一化 -> 每段按弧长等间距重采样 -> 转 stroke-3。
-（先归一化再重采样，这样 resample_spacing 以归一化后的尺度为单位，与数据原始范围无关。）
-stroke-3 即 Sketch-RNN 的输入格式：每行 [dx, dy, pen_lift]，pen_lift=1 表示该点后抬笔。
+Pipeline: segment by pen up/down -> global normalization -> resample each stroke at equal
+arc-length spacing -> convert to stroke-3.
+(Normalize before resampling so resample_spacing is in normalized units, independent of
+the original data range.)
+stroke-3 is the Sketch-RNN input format: each row [dx, dy, pen_lift], pen_lift=1 means
+the pen lifts after this point.
 """
 from __future__ import annotations
 
@@ -11,7 +14,7 @@ import numpy as np
 
 def segment_strokes(x: np.ndarray, y: np.ndarray, pen_down: np.ndarray,
                     min_points: int = 3):
-    """按落笔连续段切分为多笔。返回 [(N_i, 2), ...]。"""
+    """Split into strokes by contiguous pen-down runs. Returns [(N_i, 2), ...]."""
     strokes = []
     n = len(x)
     i = 0
@@ -31,7 +34,7 @@ def segment_strokes(x: np.ndarray, y: np.ndarray, pen_down: np.ndarray,
 
 
 def resample_stroke(points: np.ndarray, spacing: float) -> np.ndarray:
-    """按弧长等间距重采样一笔。spacing 为目标点间距（归一化后的坐标单位，默认 0~255 尺度）。"""
+    """Resample one stroke at equal arc-length spacing. spacing is the target point distance (normalized units, default 0~255 scale)."""
     if len(points) < 2:
         return points
     d = np.hypot(np.diff(points[:, 0]), np.diff(points[:, 1]))
@@ -47,7 +50,7 @@ def resample_stroke(points: np.ndarray, spacing: float) -> np.ndarray:
 
 
 def normalize_strokes(strokes, target_size: float = 255.0):
-    """整体居中并等比缩放到统一尺度（保持长宽比）。"""
+    """Center all strokes and uniformly scale to a common size (aspect ratio preserved)."""
     if not strokes:
         return strokes
     allp = np.concatenate(strokes, axis=0)
@@ -62,7 +65,7 @@ def normalize_strokes(strokes, target_size: float = 255.0):
 
 
 def to_stroke3(strokes) -> np.ndarray:
-    """转 Sketch-RNN 的 stroke-3 格式：[dx, dy, pen_lift]。"""
+    """Convert to Sketch-RNN stroke-3 format: [dx, dy, pen_lift]."""
     out = []
     prev = None
     for stroke in strokes:
@@ -80,7 +83,7 @@ def to_stroke3(strokes) -> np.ndarray:
 def extract(x: np.ndarray, y: np.ndarray, pen_down: np.ndarray,
             resample_spacing: float = 3.0, target_size: float = 255.0,
             min_points: int = 3):
-    """端到端提取：返回 (归一化后的 strokes, stroke3)。"""
+    """End-to-end extraction: returns (normalized strokes, stroke3)."""
     strokes = segment_strokes(x, y, pen_down, min_points=min_points)
     strokes = normalize_strokes(strokes, target_size=target_size)
     strokes = [resample_stroke(s, resample_spacing) for s in strokes]

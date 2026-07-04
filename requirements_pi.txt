@@ -1,8 +1,8 @@
-# 树莓派侧依赖(实时采集 / 网页作画 / 展览程序)。离线管线依赖见 requirements.txt
-# 部署: 把 capture_pi.py / web_capture.py / draw_app.py 连同 mgc3130.py、rt_filters.py
-# 拷到树莓派同一目录, 然后 pip install -r requirements_pi.txt
+# Raspberry Pi side dependencies (real-time capture / web drawing / exhibition app). Offline pipeline deps are in requirements.txt
+# Deploy: copy capture_pi.py / web_capture.py / draw_app.py together with mgc3130.py, rt_filters.py
+# to the same directory on the Pi, then pip install -r requirements_pi.txt
 lgpio>=0.2
 smbus2>=0.4
-flask>=3.0          # 仅 web_capture.py
-google-genai>=1.0   # 仅 web_capture.py 的简笔画识别
-pygame>=2.5         # 仅 draw_app.py
+flask>=3.0          # web_capture.py only
+google-genai>=1.0   # sketch recognition in web_capture.py only
+pygame>=2.5         # draw_app.py only

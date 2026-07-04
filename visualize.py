@@ -1,4 +1,4 @@
-"""轨迹可视化（保存为 PNG，便于无界面环境查看）。"""
+"""Trajectory visualization (saved as PNG for headless environments)."""
 from __future__ import annotations
 
 import matplotlib
