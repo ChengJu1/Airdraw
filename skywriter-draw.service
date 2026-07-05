@@ -1,0 +1,32 @@
+# Skywriter 展览程序 systemd 用户服务：开机自启 + 崩溃自动重启（看门狗）。
+#
+# 安装(在 Pi 上执行一次)：
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/skywriter-draw.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now skywriter-draw
+#
+# 常用命令：
+#   systemctl --user status skywriter-draw     # 看状态
+#   journalctl --user -u skywriter-draw -f     # 看日志
+#   systemctl --user stop skywriter-draw       # 停(调试时用；ESC 退出会被自动拉起，先 stop)
+#   systemctl --user disable skywriter-draw    # 取消开机自启
+#
+# 前提：Pi 设置为桌面自动登录(labwc 起来服务才有屏幕可用)；
+# Restart=always 会在 wayland 未就绪时反复重试直到成功。
+
+[Unit]
+Description=Skywriter air-drawing exhibition app
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=SDL_VIDEODRIVER=wayland
+WorkingDirectory=/home/chengju
+ExecStart=/home/chengju/sky/bin/python3 /home/chengju/draw_app.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
