@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
-"""树莓派独立全屏作画程序（展览主程序，无需电脑/浏览器/键盘）。
+"""Standalone fullscreen drawing app for Raspberry Pi (main exhibition program, no PC/browser/keyboard needed).
 
-直接驱动 HDMI 全屏(Pygame)，读 Skywriter，实时处理(范围校准 / 中值+尖刺门控+1€ 平滑 /
-出界+跳变断笔)，并录制 CSV。滤波链与 web_capture.py 共用 rt_filters.py。
+Drives HDMI fullscreen directly (Pygame), reads the Skywriter, does real-time processing (range calibration /
+median + spike gate + 1€ smoothing / out-of-range + jump stroke breaks), and records CSV. Filter chain shared with web_capture.py via rt_filters.py.
 
-展览闭环：
-  画画 -> 停笔且手离开 AI_WAIT_SEC 秒 -> 自动送 AI 识别(Gemini 看图) ->
-  文生图重建(Pollinations 免费) -> 全屏对比展示(你的涂鸦 vs AI 重建) ->
-  RESULT_SEC 秒后清屏等下一位。没网/没 key 时自动降级为纯画画+自动清屏。
+Exhibition loop:
+  draw -> pen idle and hand away for AI_WAIT_SEC s -> auto-send to AI recognition (Gemini vision) ->
+  text-to-image reconstruction (Pollinations, free) -> fullscreen side-by-side (your doodle vs the AI remake) ->
+  clear after RESULT_SEC s and wait for the next visitor. No network / no key: degrades to plain drawing + auto clear.
 
-展览 UI / 交互：
-  - 深色背景，传感器范围固定映射到屏幕中央画布（手在哪、光标就在哪）
-  - 实时光标：落笔=实心亮点，抬笔=空心圆环
-  - 右下角小地图：传感器 XY 感应范围 + 出界抬笔区 + 当前位置点 + Z 高度计
-  - 手势：快速划过=清屏(停笔片刻后生效)；颜色每抬一笔自动轮换
-  - 声音反馈：落笔/抬笔/清屏/换色/识别完成；无声卡自动静音
-  - 传感器 I2C 自愈：启动失败/中途掉线不退出，硬件复位循环重连并在屏幕提示
-  - 键盘(调试用)：ESC/Q 退出  空格/C 清屏  回车 立即送AI  D 调试
-    方向校准(实时生效): X 左右镜像  Y 上下镜像  S 交换XY轴
+Exhibition UI / interaction:
+  - Dark background, sensor range mapped to a fixed canvas at screen center (cursor goes where the hand goes)
+  - Live cursor: pen down = solid bright dot, pen up = hollow ring
+  - Bottom-right minimap: sensor XY range + out-of-range pen-up zone + current position dot + Z height gauge
+  - Gestures: fast flick = clear (armed after a short pen pause); color auto-rotates on every stroke
+  - Sound feedback: pen down/up/clear/color change/recognition done; auto-mutes without a sound card
+  - Sensor I2C self-healing: startup failure / mid-run dropout never exits; hardware-reset reconnect loop with an on-screen notice
+  - Keyboard (debug): ESC/Q quit  Space/C clear  Enter send to AI now  D debug
+    orientation calibration (applies live): X mirror left-right  Y mirror up-down  S swap XY axes
 
-依赖(在已装 lgpio/smbus2 的同一 venv 内): pip install pygame
-AI 部分走 REST(urllib)，无需 google-genai/PIL。密钥读 key_local.py 或环境变量
-GEMINI_API_KEY —— 需连同 mgc3130.py、rt_filters.py、key_local.py 拷到同一目录。
-开机自启+崩溃自动重启: 见 skywriter-draw.service（装法见该文件头部注释）。
-手动运行: ~/start_draw.sh
+Dependencies (same venv that already has lgpio/smbus2): pip install pygame
+AI part uses plain REST (urllib), no google-genai/PIL needed. Keys come from key_local.py or the env var
+GEMINI_API_KEY -- copy mgc3130.py, rt_filters.py and key_local.py into the same directory.
+Auto-start on boot + restart on crash: see skywriter-draw.service (install notes in its header comment).
+Manual run: ~/start_draw.sh
 """
 import array
 import base64
@@ -42,41 +42,41 @@ import atexit
 from mgc3130 import MGC3130, parse_frame, parse_gesture, probe_i2c, FLICKS
 from rt_filters import MedianWin, SpikeGate, OneEuro, ZPenHysteresis
 
-# ============== 处理参数（滤波链参数在 rt_filters.py，与 web_capture.py 共用） ==============
+# ============== Processing params (filter chain params live in rt_filters.py, shared with web_capture.py) ==============
 FLIP_X = False
 FLIP_Y = True
 SWAP_XY = False
-X_LO, X_HI = 0.08, 0.92         # 实测(cal_20260705)两端各~8%饱和贴轨，只用中段线性区
+X_LO, X_HI = 0.08, 0.92         # measured (cal_20260705): ~8% saturation hugging each end, use only the linear middle
 Y_LO, Y_HI = 0.08, 0.92
-OUT_EDGE = 0.08                 # 贴边即抬笔；与 LO/HI 对齐，饱和区(钳0/1)不画
-# z 迟滞判抬落笔：z > Z_HIGH_UP 抬笔，回落 < Z_HIGH_DOWN 恢复
-# 实测自然画画高度 z≈0.2~0.5：落笔阈值不能低于 0.5，否则画画高度上半段贴着
-# 阈值边界会碎成断点(0.45 试过，断触严重)
+OUT_EDGE = 0.08                 # near the edge = pen up; aligned with LO/HI, saturated zone (clamped 0/1) not drawn
+# z hysteresis for pen up/down: z > Z_HIGH_UP lifts the pen, falling back < Z_HIGH_DOWN resumes
+# measured natural drawing height z≈0.2~0.5: pen-down threshold must not go below 0.5, otherwise the
+# upper half of the drawing range hugs the threshold and shatters into breaks (tried 0.45, broke badly)
 Z_HIGH_UP = 0.60
 Z_HIGH_DOWN = 0.50
-MAX_JUMP = 0.07                 # 快速移动的引线判为抬笔，不画出来(放宽减少误断)
-AUTO_CLEAR_SEC = 8.0            # (AI 不可用时的兜底)手离开这么久自动清屏
+MAX_JUMP = 0.07                 # fast-move lead-in lines count as pen up, not drawn (loosened to reduce false breaks)
+AUTO_CLEAR_SEC = 8.0            # (fallback when AI is unavailable) auto clear after hand away this long
 
-# ============== 手势 & 声音 ==============
-FLICK_CLEARS = True             # 快速划过 = 清屏
-FLICK_DEBOUNCE = 1.2            # 两次 flick 最小间隔(秒)
-GESTURE_IDLE = 0.5              # 停笔这么久后手势才解锁，画画途中不误触
-SOUND = True                    # 声音反馈总开关
+# ============== Gestures & sound ==============
+FLICK_CLEARS = True             # fast flick = clear canvas
+FLICK_DEBOUNCE = 1.2            # min interval between two flicks (s)
+GESTURE_IDLE = 0.5              # gestures unlock after the pen idles this long, no misfires while drawing
+SOUND = True                    # master switch for sound feedback
 
-# ============== AI 识别与重建（流程同 reconstruct_llm.py，纯 urllib 版） ==============
-AI_WAIT_SEC = 3.0               # 停笔且手离开这么久 => 自动送 AI
-RESULT_SEC = 15.0               # 结果展示时长，之后清屏等下一位
-MIN_PTS_FOR_AI = 12             # 总点数太少(误触)不送 AI
+# ============== AI recognition & reconstruction (same flow as reconstruct_llm.py, pure urllib) ==============
+AI_WAIT_SEC = 3.0               # pen idle and hand away this long => auto-send to AI
+RESULT_SEC = 15.0               # result display duration, then clear for the next visitor
+MIN_PTS_FOR_AI = 12             # too few total points (accidental touch) => don't send to AI
 G_VISION_MODEL = "gemini-2.5-flash"
 SYS_PROMPT = (
-    "你是手绘草图识别助手。用户给你一张非常粗糙的单色简笔画轨迹，"
-    "可能是单个物体，也可能是几样东西拼成的一个场景。"
-    "请判断画的是什么，然后写一段用于文生图模型的英文提示词，"
-    "目标是生成一张干净、可识别、风格统一的插画；"
-    "若有多个元素，把它们自然地组合进同一张场景图，保持原画的相对布局。"
-    '只输出 JSON：{"label": "short english name", "prompt": "english text-to-image prompt"}。'
-    "label 和 prompt 都用英文，label 不超过 4 个词。提示词里加上 "
-    "'simple, clean line illustration, white background, centered'。"
+    "You are a hand-drawn sketch recognition assistant. The user gives you a very rough monochrome line-drawing trace; "
+    "it may be a single object, or a few things combined into one scene. "
+    "Decide what was drawn, then write an English prompt for a text-to-image model "
+    "aiming for a clean, recognizable, consistently styled illustration; "
+    "if there are multiple elements, blend them naturally into one scene, keeping the original relative layout. "
+    'Output JSON only: {"label": "short english name", "prompt": "english text-to-image prompt"}. '
+    "Both label and prompt must be in English; label at most 4 words. Add "
+    "'simple, clean line illustration, white background, centered' to the prompt."
 )
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -90,41 +90,41 @@ try:
 except ImportError:
     pass
 AI_ENABLED = bool(SF_KEY or GEMINI_KEY)
-# 主方案：Gemini 付费层一个 key 全包(识别 gemini-2.5-flash + 出图 nano banana)。
-# 注意免费层不够用：识别每天仅 20 次、出图额度为 0，务必开计费。
-# 识别顺序：硅基流动(如有key) -> Gemini
-# 文生图顺序：Gemini -> Replicate -> 硅基流动 -> Pollinations(免费兜底)
+# Main plan: one paid-tier Gemini key covers everything (recognition gemini-2.5-flash + images nano banana).
+# Free tier is not enough: only 20 recognitions/day and zero image quota, make sure billing is on.
+# Recognition order: SiliconFlow (if key present) -> Gemini
+# Text-to-image order: Gemini -> Replicate -> SiliconFlow -> Pollinations (free fallback)
 G_IMAGE_MODEL = "gemini-2.5-flash-image"
 SF_VISION_MODEL = "Qwen/Qwen2.5-VL-32B-Instruct"
 SF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 
-# ============== 展示外观 ==============
-FILL = 0.80                     # 画布占屏幕短边比例
-BG = (10, 12, 18)               # 全屏底色
-CANVAS_BG = (17, 20, 30)        # 画布底色
+# ============== Display appearance ==============
+FILL = 0.80                     # canvas size as a fraction of the shorter screen side
+BG = (10, 12, 18)               # fullscreen background
+CANVAS_BG = (17, 20, 30)        # canvas background
 CANVAS_BORDER = (54, 62, 88)
 TXT = (225, 230, 240)
 TXT_DIM = (108, 118, 142)
-GREEN = (90, 220, 160)          # 落笔/可画状态
-AMBER = (255, 190, 90)          # 抬笔/边界警示
+GREEN = (90, 220, 160)          # pen down / drawable state
+AMBER = (255, 190, 90)          # pen up / boundary warning
 LINE_W = 5
-INK_PALETTE = [                 # 每抬一笔自动轮换一种颜色
-    (240, 242, 248),            # 亮白
-    (120, 200, 255),            # 天蓝
-    (140, 235, 190),            # 薄荷
-    (250, 200, 120),            # 琥珀
-    (210, 160, 255),            # 薰衣草
-    (255, 150, 165),            # 珊瑚
+INK_PALETTE = [                 # color auto-rotates on every pen up
+    (240, 242, 248),            # bright white
+    (120, 200, 255),            # sky blue
+    (140, 235, 190),            # mint
+    (250, 200, 120),            # amber
+    (210, 160, 255),            # lavender
+    (255, 150, 165),            # coral
 ]
 # ===================================================================
 
-# ---- 滤波链(实现与参数见 rt_filters.py) ----
+# ---- Filter chain (implementation and params in rt_filters.py) ----
 med_f = MedianWin()
 spike = SpikeGate()
 fx = OneEuro()
 fy = OneEuro()
 zpen = ZPenHysteresis(down=Z_HIGH_DOWN, up=Z_HIGH_UP)
-# 光标悬停平滑（独立于画线滤波，抬笔时也持续工作）
+# hover cursor smoothing (independent of the stroke filters, keeps running while pen is up)
 hx = OneEuro()
 hy = OneEuro()
 
@@ -146,7 +146,7 @@ def lerp_color(a, b, f):
             int(a[2] + (b[2] - a[2]) * f))
 
 
-# ---- 声音（程序化合成，不依赖音频文件；无声卡则静音） ----
+# ---- Sound (synthesized in code, no audio files; silent without a sound card) ----
 SND = {}
 
 
@@ -159,7 +159,7 @@ def snd(name):
 
 
 def build_sounds():
-    """启动时合成几段短音效。mixer 没起来(无声卡)返回空。"""
+    """Synthesize a few short sound effects at startup. Returns empty if the mixer is down (no sound card)."""
     import pygame
     if not pygame.mixer.get_init():
         return {}
@@ -184,12 +184,12 @@ def build_sounds():
         return pygame.mixer.Sound(buffer=a.tobytes())
 
     return {
-        "down": tone(880, 45, 0.5),            # 落笔"嗒"
-        "up": tone(520, 35, 0.22),             # 抬笔轻响
-        "clear": tone(700, 230, 0.4, freq2=170),   # 清屏下滑音
-        "tick": tone(1320, 25, 0.3),           # 换色咔哒
-        "success": arp([523, 659, 784, 1046]),  # 识别完成小琶音
-        "fail": tone(170, 260, 0.35),          # AI 失败低鸣
+        "down": tone(880, 45, 0.5),            # pen-down "tap"
+        "up": tone(520, 35, 0.22),             # soft pen-up blip
+        "clear": tone(700, 230, 0.4, freq2=170),   # clear-canvas downward sweep
+        "tick": tone(1320, 25, 0.3),           # color-change click
+        "success": arp([523, 659, 784, 1046]),  # little arpeggio on recognition done
+        "fail": tone(170, 260, 0.35),          # low buzz on AI failure
     }
 
 
@@ -210,37 +210,37 @@ def _close():
         pass
 
 
-# ---- 共享绘画/光标/传感器状态 ----
+# ---- Shared drawing / cursor / sensor state ----
 lock = threading.Lock()
-strokes = [[0, []]]            # 每元素 [调色板序号, 点列表(0..1)]
-color_idx = 0                  # 当前画笔颜色(AirWheel 转圈 / 抬笔自动轮换)
+strokes = [[0, []]]            # each element: [palette index, list of points (0..1)]
+color_idx = 0                  # current ink color (AirWheel spin / auto-rotates on pen up)
 pen_now = 0
-last_activity = time.time()    # 最近一次检测到手的时刻
-draw_last = 0.0                # 最近一次真正落笔画点的时刻(AI 触发依据)
-raw_range = [1.0, 0.0, 1.0, 0.0]   # mnx,mxx,mny,mxy (调试用)
+last_activity = time.time()    # last time a hand was detected
+draw_last = 0.0                # last time a point was actually drawn pen-down (drives the AI trigger)
+raw_range = [1.0, 0.0, 1.0, 0.0]   # mnx,mxx,mny,mxy (debug)
 t0 = time.time()
 
-cur_x, cur_y = 0.5, 0.5        # 光标位置(0..1，画布坐标)
-cur_z = 1.0                    # 当前手高度(0..1)
-cur_seen = 0.0                 # 最近一次有效帧时刻
+cur_x, cur_y = 0.5, 0.5        # cursor position (0..1, canvas coords)
+cur_z = 1.0                    # current hand height (0..1)
+cur_seen = 0.0                 # last valid frame time
 prev_pen = 0
-gest_dbg = [0, 0, 0]           # 最近的手势码 / airwheel活跃 / 计数(调试栏显示)
+gest_dbg = [0, 0, 0]           # last gesture code / airwheel active / count (debug bar)
 
-sensor = None                  # 由 reader 线程创建/重建（I2C 自愈）
+sensor = None                  # created/rebuilt by the reader thread (I2C self-healing)
 sensor_ok = False
 
-# ---- AI 状态(主循环与 worker 线程共享) ----
+# ---- AI state (shared between main loop and worker thread) ----
 ai_lock = threading.Lock()
 ai = {
     "mode": "draw",            # draw / thinking / result
-    "token": 0,                # 每次触发/取消 +1，worker 结果过期即丢弃
+    "token": 0,                # +1 on every trigger/cancel; stale worker results are dropped
     "label": "",
-    "img": None,               # 生成图 Surface
-    "sketch": None,            # 送识别的简笔画 Surface(白底黑线)
-    "t0": 0.0,                 # 进入 result 的时刻
+    "img": None,               # generated image Surface
+    "sketch": None,            # sketch Surface sent for recognition (black lines on white)
+    "t0": 0.0,                 # time result mode was entered
     "err": "",
     "err_t": 0.0,
-    "_cache": None,            # result 缩放缓存
+    "_cache": None,            # scaled result cache
 }
 
 
@@ -253,20 +253,20 @@ def clear_canvas():
 
 
 def reader():
-    """传感器读取线程：I2C 自愈 + 手势 + 滤波成笔画。"""
+    """Sensor reader thread: I2C self-healing + gestures + filtering into strokes."""
     global sensor, sensor_ok
     global pen_now, last_activity, draw_last, prev_pen, color_idx
     global cur_x, cur_y, cur_z, cur_seen
     last_ts = None
     last_draw = None
     last_flick = 0.0
-    z_hist = []                # z 三点中值窗，压掉单帧尖刺引起的误断笔
+    z_hist = []                # 3-point median window on z, kills false breaks from single-frame spikes
     err_streak = 0
     last_frame_t = time.time()
     cnt = 0
 
     def reconnect():
-        """关掉旧句柄，硬件复位重连。失败慢速重试，程序不退出。"""
+        """Close the old handle, hardware-reset and reconnect. Slow retry on failure, never exits."""
         nonlocal err_streak, last_frame_t
         global sensor, sensor_ok
         sensor_ok = False
@@ -281,9 +281,9 @@ def reader():
             sensor_ok = True
             err_streak = 0
             last_frame_t = time.time()
-            print("传感器已连接")
+            print("sensor connected")
         except Exception as exc:  # noqa: BLE001
-            print("传感器重连失败(2秒后再试): %r" % (exc,))
+            print("sensor reconnect failed (retry in 2 s): %r" % (exc,))
             time.sleep(2.0)
 
     while True:
@@ -310,31 +310,31 @@ def reader():
                     rx, ry, rz, valid = parse_frame(d)
                     gest, aw_active, aw_count = parse_gesture(d)
 
-                    # 手势：停笔 GESTURE_IDLE 秒后解锁，画画途中不误触
+                    # gestures: unlock GESTURE_IDLE s after the pen idles, no misfires while drawing
                     now = time.time()
                     gest_dbg[0], gest_dbg[1], gest_dbg[2] = gest, int(aw_active), aw_count
                     gesture_ok = (draw_last == 0 or now - draw_last > GESTURE_IDLE)
 
-                    # 快速划过 = 清屏(也会跳过结果页)
+                    # fast flick = clear canvas (also skips the result page)
                     if FLICK_CLEARS and gest in FLICKS and gesture_ok and \
                             now - last_flick > FLICK_DEBOUNCE:
                         last_flick = now
                         ai_cancel()
                         clear_canvas()
                         snd("clear")
-                        print("手势: 划过清屏 (code=%d)" % gest)
+                        print("gesture: flick clear (code=%d)" % gest)
 
                     if valid:
                         raw_range[0] = min(raw_range[0], rx); raw_range[1] = max(raw_range[1], rx)
                         raw_range[2] = min(raw_range[2], ry); raw_range[3] = max(raw_range[3], ry)
 
-                        # z 先过三点中值再进迟滞，单帧尖刺不再造成误断笔
+                        # z goes through the 3-point median before hysteresis, single-frame spikes no longer break strokes
                         z_hist.append(rz)
                         if len(z_hist) > 3:
                             z_hist.pop(0)
                         zf = sorted(z_hist)[len(z_hist) // 2]
 
-                        # z 迟滞判抬落笔；边缘饱和 => 强制抬笔
+                        # z hysteresis decides pen up/down; edge saturation => force pen up
                         edge_out = (rx < OUT_EDGE or rx > 1 - OUT_EDGE or
                                     ry < OUT_EDGE or ry > 1 - OUT_EDGE)
                         pen = zpen(zf)
@@ -351,7 +351,7 @@ def reader():
                             my = 1.0 - my
                         mx = min(1.0, max(0.0, mx)); my = min(1.0, max(0.0, my))
 
-                        # 悬停光标：无论抬落笔都持续平滑，观众始终能看到"我在哪"
+                        # hover cursor: smoothed regardless of pen state, visitors always see "where am I"
                         hvx = hx(mx, t); hvy = hy(my, t)
 
                         sx = sy = None
@@ -365,7 +365,7 @@ def reader():
                             mx, my = med_f(mx, my)
                             mx, my = spike(mx, my)
                             sx = fx(mx, t); sy = fy(my, t)
-                            # 跳变保护：快速重定位不连长线
+                            # jump guard: fast repositioning doesn't connect a long line
                             if last_draw is not None and \
                                     math.hypot(sx - last_draw[0], sy - last_draw[1]) > MAX_JUMP:
                                 pen = 0
@@ -381,7 +381,7 @@ def reader():
                             with lock:
                                 if not strokes:
                                     strokes.append([color_idx, []])
-                                if not strokes[-1][1]:      # 本笔第一个点定颜色
+                                if not strokes[-1][1]:      # first point of the stroke fixes its color
                                     strokes[-1][0] = color_idx
                                 strokes[-1][1].append((sx, sy))
                             cur_x, cur_y = sx, sy
@@ -389,7 +389,7 @@ def reader():
                         else:
                             with lock:
                                 if strokes and strokes[-1][1]:
-                                    # 抬笔=开新一笔，颜色自动走一格(AirWheel 可再调)
+                                    # pen up = start a new stroke, color steps one (AirWheel can adjust)
                                     color_idx = (color_idx + 1) % len(INK_PALETTE)
                                     strokes.append([color_idx, []])
                             cur_x, cur_y = hvx, hvy
@@ -420,33 +420,33 @@ def reader():
                     if cnt % 50 == 0:
                         csv_file.flush()
         else:
-            # 长时间无帧不一定是挂死：空闲(无人)时芯片可能不出帧。
-            # 先探测总线，芯片还应答就只是空闲；真掉线才复位重连。
+            # a long gap without frames isn't necessarily a hang: the chip may go quiet when idle (nobody there).
+            # probe the bus first; if the chip still answers it's just idle, only a real dropout triggers reset+reconnect.
             if time.time() - last_frame_t > 3.0:
                 if probe_i2c():
                     last_frame_t = time.time()
                     sensor_ok = True
                 else:
-                    print("传感器无数据且总线无应答，复位重连")
+                    print("sensor silent and bus not answering, reset and reconnect")
                     reconnect()
         time.sleep(0.001)
       except OSError:
-        # 偶发 I2C / GPIO 错误：跳过；连续太多则重连
+        # occasional I2C / GPIO error: skip; reconnect after too many in a row
         err_streak += 1
         if err_streak > 100:
             reconnect()
         time.sleep(0.002)
       except Exception as exc:  # noqa: BLE001
-        print("reader 异常(已跳过): %r" % (exc,))
+        print("reader exception (skipped): %r" % (exc,))
         err_streak += 1
         if err_streak > 100:
             reconnect()
         time.sleep(0.002)
 
 
-# ================== AI：简笔画渲染 / 识别 / 文生图 ==================
+# ================== AI: sketch rendering / recognition / text-to-image ==================
 def sketch_png(snap, px=512):
-    """把笔画快照渲染成白底黑线 PNG(bytes) + Surface，居中自适应缩放。"""
+    """Render a stroke snapshot as black-on-white PNG (bytes) + Surface, centered and auto-scaled."""
     import pygame
     surf = pygame.Surface((px, px))
     surf.fill((255, 255, 255))
@@ -467,15 +467,15 @@ def sketch_png(snap, px=512):
 
 
 def _json_from_text(txt):
-    """从模型回复里抠出 JSON(容忍 ```json 围栏和前后废话)。"""
+    """Dig the JSON out of a model reply (tolerates ```json fences and surrounding chatter)."""
     i, j = txt.find("{"), txt.rfind("}")
     if i < 0 or j <= i:
-        raise ValueError("回复里没有 JSON: %r" % txt[:120])
+        raise ValueError("no JSON in reply: %r" % txt[:120])
     return json.loads(txt[i:j + 1])
 
 
 def sf_recognize(png_bytes):
-    """硅基流动 Qwen-VL 看图识别，返回 {"label":..., "prompt":...}。"""
+    """SiliconFlow Qwen-VL vision recognition, returns {"label":..., "prompt":...}."""
     b64 = base64.b64encode(png_bytes).decode()
     body = {
         "model": SF_VISION_MODEL,
@@ -484,7 +484,7 @@ def sf_recognize(png_bytes):
             {"role": "user", "content": [
                 {"type": "image_url",
                  "image_url": {"url": "data:image/png;base64," + b64}},
-                {"type": "text", "text": "这是粗糙轨迹，请识别并给出提示词。"},
+                {"type": "text", "text": "This is a rough trace. Identify it and give the prompt."},
             ]},
         ],
         "temperature": 0.2,
@@ -501,24 +501,24 @@ def sf_recognize(png_bytes):
 
 
 def recognize(png_bytes):
-    """识别：硅基流动优先，失败退 Gemini(免费层每天仅20次)。"""
+    """Recognition: SiliconFlow first, fall back to Gemini (free tier: only 20/day)."""
     if SF_KEY:
         try:
             return sf_recognize(png_bytes)
         except Exception as exc:  # noqa: BLE001
-            print("硅基流动识别失败，试 Gemini: %r" % (exc,))
+            print("SiliconFlow recognition failed, trying Gemini: %r" % (exc,))
     return gemini_recognize(png_bytes)
 
 
 def gemini_recognize(png_bytes):
-    """Gemini REST 看图识别，返回 {"label":..., "prompt":...}。"""
+    """Gemini REST vision recognition, returns {"label":..., "prompt":...}."""
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
            "%s:generateContent?key=%s" % (G_VISION_MODEL, GEMINI_KEY))
     body = {
         "contents": [{"parts": [
             {"inline_data": {"mime_type": "image/png",
                              "data": base64.b64encode(png_bytes).decode()}},
-            {"text": SYS_PROMPT + "\n这是粗糙轨迹，请识别并给出提示词。"},
+            {"text": SYS_PROMPT + "\nThis is a rough trace. Identify it and give the prompt."},
         ]}],
         "generationConfig": {"response_mime_type": "application/json"},
     }
@@ -530,7 +530,7 @@ def gemini_recognize(png_bytes):
 
 
 def gemini_image(prompt):
-    """Gemini 文生图(gemini-2.5-flash-image，需付费层)，返回图片 bytes。"""
+    """Gemini text-to-image (gemini-2.5-flash-image, paid tier required), returns image bytes."""
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
            "%s:generateContent?key=%s" % (G_IMAGE_MODEL, GEMINI_KEY))
     body = {"contents": [{"parts": [{"text": prompt}]}],
@@ -542,11 +542,11 @@ def gemini_image(prompt):
     for p in resp["candidates"][0]["content"]["parts"]:
         if "inlineData" in p:
             return base64.b64decode(p["inlineData"]["data"])
-    raise ValueError("Gemini 没返回图片 part")
+    raise ValueError("Gemini returned no image part")
 
 
 def replicate_image(prompt):
-    """Replicate FLUX.1 schnell 文生图(Prefer:wait 同步返回)，返回图片 bytes。"""
+    """Replicate FLUX.1 schnell text-to-image (Prefer:wait, synchronous), returns image bytes."""
     body = {"input": {"prompt": prompt, "aspect_ratio": "1:1",
                       "output_format": "jpg", "num_outputs": 1}}
     req = urllib.request.Request(
@@ -564,9 +564,9 @@ def replicate_image(prompt):
 
 
 def sf_image(prompt):
-    """硅基流动 FLUX.1 schnell 文生图，1-3 秒出图，返回图片 bytes。
+    """SiliconFlow FLUX.1 schnell text-to-image, 1-3 s per image, returns image bytes.
 
-    接口先返回图片 URL(有效期 1 小时)，再下载成 bytes。
+    The API returns an image URL first (valid for 1 hour), then it's downloaded as bytes.
     """
     body = {"model": SF_IMAGE_MODEL, "prompt": prompt,
             "image_size": "768x768", "batch_size": 1,
@@ -584,7 +584,7 @@ def sf_image(prompt):
 
 
 def pollinations_image(prompt):
-    """免费文生图(无需 key)，慢但兜底，返回图片 bytes。"""
+    """Free text-to-image (no key needed), slow but a safety net, returns image bytes."""
     url = ("https://image.pollinations.ai/prompt/"
            + urllib.parse.quote(prompt)
            + "?width=768&height=768&nologo=true&model=flux")
@@ -594,20 +594,20 @@ def pollinations_image(prompt):
 
 
 def generate_image(prompt):
-    """按 Gemini -> Replicate -> 硅基流动 -> Pollinations 顺序尝试，有 key 就试。"""
+    """Try Gemini -> Replicate -> SiliconFlow -> Pollinations in order, whichever has a key."""
     for name, key, fn in (("Gemini", GEMINI_KEY, gemini_image),
                           ("Replicate", REPLICATE_KEY, replicate_image),
-                          ("硅基流动", SF_KEY, sf_image)):
+                          ("SiliconFlow", SF_KEY, sf_image)):
         if key:
             try:
                 return fn(prompt)
             except Exception as exc:  # noqa: BLE001
-                print("%s 生成失败，试下一家: %r" % (name, exc))
+                print("%s generation failed, trying next: %r" % (name, exc))
     return pollinations_image(prompt)
 
 
 def ai_worker(snap, token):
-    """后台线程：渲染 -> 识别 -> 生成。token 过期(访客又画了/清屏)则丢弃结果。"""
+    """Background thread: render -> recognize -> generate. Stale token (visitor drew again / cleared) drops the result."""
     import pygame
     try:
         png, surf = sketch_png(snap)
@@ -624,7 +624,7 @@ def ai_worker(snap, token):
                           t0=time.time(), err="", _cache=None)
                 snd("success")
     except Exception as exc:  # noqa: BLE001
-        print("AI 失败(降级继续画画): %r" % (exc,))
+        print("AI failed (degrading, drawing continues): %r" % (exc,))
         with ai_lock:
             if ai["token"] == token:
                 ai.update(mode="draw", err=str(exc), err_t=time.time())
@@ -646,7 +646,7 @@ def ai_trigger(snap):
     threading.Thread(target=ai_worker, args=(snap, token), daemon=True).start()
 
 
-# ============================== 主程序 ==============================
+# ============================== Main program ==============================
 def main():
     global FLIP_X, FLIP_Y, SWAP_XY
     import pygame
@@ -655,7 +655,7 @@ def main():
     try:
         SND.update(build_sounds())
     except Exception as exc:  # noqa: BLE001
-        print("声音初始化失败(静音继续): %r" % (exc,))
+        print("sound init failed (continuing muted): %r" % (exc,))
     pygame.mouse.set_visible(False)
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     W, H = screen.get_size()
@@ -664,29 +664,29 @@ def main():
     f_mid = pygame.font.SysFont(None, 30)
     f_sml = pygame.font.SysFont(None, 21)
 
-    # 画布：传感器范围固定映射到屏幕中央正方形
+    # canvas: sensor range mapped to a fixed square in the screen center
     side = int(min(W, H) * FILL)
     canvas = pygame.Rect((W - side) // 2, (H - side) // 2, side, side)
 
     def to_px(p):
         return (canvas.left + p[0] * side, canvas.top + p[1] * side)
 
-    # 小地图布局（右下角）
-    MM = max(120, int(min(W, H) * 0.16))       # 小地图边长
-    GW = 16                                    # 高度计宽
+    # minimap layout (bottom right)
+    MM = max(120, int(min(W, H) * 0.16))       # minimap side length
+    GW = 16                                    # height gauge width
     PAD = 14
     panel = pygame.Rect(0, 0, MM + GW + PAD * 3, MM + PAD * 2 + 26)
     panel.bottomright = (W - 28, H - 28)
     mm_rect = pygame.Rect(panel.left + PAD, panel.top + PAD + 22, MM, MM)
     gauge = pygame.Rect(mm_rect.right + PAD, mm_rect.top, GW, MM)
 
-    # 手势说明 + 调色板（左下角）
+    # gesture hints + palette (bottom left)
     hint_panel = pygame.Rect(0, 0, 300, panel.height)
     hint_panel.bottomleft = (28, H - 28)
 
     threading.Thread(target=reader, daemon=True).start()
 
-    trigger_draw_last = -1.0    # 触发 AI 时的 draw_last，之后又画了就取消
+    trigger_draw_last = -1.0    # draw_last at AI trigger time; drawing after that cancels
     show_debug = False
     running = True
     while running:
@@ -706,7 +706,7 @@ def main():
                     snd("clear")
                 elif ev.key == pygame.K_d:
                     show_debug = not show_debug
-                elif ev.key == pygame.K_x:      # 方向校准，实时生效
+                elif ev.key == pygame.K_x:      # orientation calibration, applies live
                     FLIP_X = not FLIP_X
                 elif ev.key == pygame.K_y:
                     FLIP_Y = not FLIP_Y
@@ -721,7 +721,7 @@ def main():
                         ai_trigger(snap_now)
                         mode = "thinking"
 
-        hand = (now - cur_seen) < 0.35          # 最近有有效帧 => 手在感应区
+        hand = (now - cur_seen) < 0.35          # valid frame recently => hand in range
         idle = now - last_activity
 
         with lock:
@@ -729,9 +729,9 @@ def main():
             has_content = any(s for _, s in strokes)
         n_pts = sum(len(s) for _, s in snap)
 
-        # ---------- 状态机 ----------
+        # ---------- State machine ----------
         if mode == "draw":
-            # 停笔+手离开 => 自动送 AI；AI 不可用则走兜底自动清屏
+            # pen idle + hand away => auto-send to AI; fallback auto clear if AI unavailable
             if AI_ENABLED and n_pts >= MIN_PTS_FOR_AI and not hand \
                     and draw_last > 0 and now - draw_last > AI_WAIT_SEC:
                 trigger_draw_last = draw_last
@@ -741,18 +741,18 @@ def main():
                     (not AI_ENABLED or n_pts < MIN_PTS_FOR_AI):
                 clear_canvas()
         elif mode == "thinking":
-            if draw_last != trigger_draw_last:   # 访客回来又画了 => 取消本次
+            if draw_last != trigger_draw_last:   # visitor came back and drew => cancel this run
                 ai_cancel()
                 mode = "draw"
         elif mode == "result":
             with ai_lock:
                 shown = now - ai["t0"]
-            if shown > RESULT_SEC or pen_now:    # 到时 / 有人开始画 => 清屏重来
+            if shown > RESULT_SEC or pen_now:    # time's up / someone starts drawing => clear and restart
                 ai_cancel()
                 clear_canvas()
                 mode = "draw"
 
-        # ---------- 结果展示页 ----------
+        # ---------- Result page ----------
         if mode == "result":
             with ai_lock:
                 label, img, sk = ai["label"], ai["img"], ai["sketch"]
@@ -787,18 +787,18 @@ def main():
             clock.tick(60)
             continue
 
-        # ---------- 背景 & 画布 ----------
+        # ---------- Background & canvas ----------
         screen.fill(BG)
         pygame.draw.rect(screen, CANVAS_BG, canvas, border_radius=14)
         pygame.draw.rect(screen, CANVAS_BORDER, canvas, width=2, border_radius=14)
 
-        # 画布中心十字：给观众一个"原点"参照
+        # canvas center cross: gives visitors an "origin" reference
         ccx, ccy = canvas.center
         cross = lerp_color(CANVAS_BG, TXT_DIM, 0.55)
         pygame.draw.line(screen, cross, (ccx - 12, ccy), (ccx + 12, ccy))
         pygame.draw.line(screen, cross, (ccx, ccy - 12), (ccx, ccy + 12))
 
-        # ---------- 笔画（辉光两遍：粗暗晕 + 亮细芯） ----------
+        # ---------- Strokes (two-pass glow: wide dim halo + bright thin core) ----------
         screen.set_clip(canvas)
         for ci, s in snap:
             color = INK_PALETTE[ci % len(INK_PALETTE)]
@@ -807,10 +807,10 @@ def main():
             pygame.draw.lines(screen, halo, False, proj, LINE_W + 8)
             pygame.draw.lines(screen, color, False, proj, LINE_W)
             r = LINE_W // 2
-            for px, py in proj:                 # 圆头关节，转角不豁口
+            for px, py in proj:                 # round joints, no gaps at corners
                 pygame.draw.circle(screen, color, (int(px), int(py)), r)
 
-        # ---------- 实时光标 ----------
+        # ---------- Live cursor ----------
         if hand:
             cx, cy = to_px((cur_x, cur_y))
             cx, cy = int(cx), int(cy)
@@ -826,7 +826,7 @@ def main():
                 pygame.draw.circle(screen, ink, (cx, cy), 3)
         screen.set_clip(None)
 
-        # ---------- 传感器离线提示 ----------
+        # ---------- Sensor offline notice ----------
         if not sensor_ok:
             pulse = 0.5 + 0.5 * math.sin(now * 3.0)
             t1 = f_big.render("SENSOR RECONNECTING", True,
@@ -834,7 +834,7 @@ def main():
             t2 = f_mid.render("please wait / check the Skywriter board", True, TXT_DIM)
             screen.blit(t1, t1.get_rect(center=(ccx, ccy - 24)))
             screen.blit(t2, t2.get_rect(center=(ccx, ccy + 28)))
-        # ---------- 待机引导（无人且画布为空） ----------
+        # ---------- Idle attract screen (nobody around and canvas empty) ----------
         elif not hand and not has_content:
             for k in (0.0, 0.5):
                 ph_ = ((now * 0.45 + k) % 1.0)
@@ -846,7 +846,7 @@ def main():
             screen.blit(t1, t1.get_rect(center=(ccx, ccy - 90)))
             screen.blit(t2, t2.get_rect(center=(ccx, ccy + 78)))
 
-        # ---------- AI 识别中提示 ----------
+        # ---------- AI recognizing notice ----------
         if mode == "thinking":
             dots = "." * (1 + int(now * 2) % 3)
             t1 = f_big.render("Recognizing%s" % dots, True, TXT)
@@ -854,7 +854,7 @@ def main():
             screen.blit(t1, t1.get_rect(center=(ccx, canvas.top + 56)))
             screen.blit(t2, t2.get_rect(center=(ccx, canvas.top + 100)))
 
-        # ---------- 顶部标题 & 状态 ----------
+        # ---------- Top title & status ----------
         title = f_mid.render("S K Y W R I T E R", True, TXT_DIM)
         screen.blit(title, title.get_rect(midtop=(W // 2, 16)))
 
@@ -869,7 +869,7 @@ def main():
         pygame.draw.circle(screen, dot_c, (30, 30), 7)
         screen.blit(f_mid.render(msg, True, TXT), (46, 19))
 
-        # AI 触发倒计时 / 失败提示
+        # AI trigger countdown / failure notice
         if AI_ENABLED and mode == "draw" and n_pts >= MIN_PTS_FOR_AI \
                 and not hand and draw_last > 0:
             left_s = AI_WAIT_SEC - (now - draw_last)
@@ -883,7 +883,7 @@ def main():
             tip = f_sml.render("AI unavailable - keep drawing", True, AMBER)
             screen.blit(tip, tip.get_rect(midbottom=(W // 2, canvas.bottom - 10)))
 
-        # ---------- 左下角：手势说明 + 调色板 ----------
+        # ---------- Bottom left: gesture hints + palette ----------
         pygame.draw.rect(screen, CANVAS_BG, hint_panel, border_radius=10)
         pygame.draw.rect(screen, CANVAS_BORDER, hint_panel, width=1, border_radius=10)
         lab = f_sml.render("GESTURES", True, TXT_DIM)
@@ -892,7 +892,7 @@ def main():
         h2 = f_sml.render("every new stroke  =  new colour", True, TXT)
         screen.blit(h1, (hint_panel.left + PAD, hint_panel.top + 32))
         screen.blit(h2, (hint_panel.left + PAD, hint_panel.top + 56))
-        # 调色板：当前色放大加环
+        # palette: current color enlarged with a ring
         sw_y = hint_panel.bottom - 28
         for i, c in enumerate(INK_PALETTE):
             sw_x = hint_panel.left + PAD + 10 + i * 34
@@ -903,13 +903,13 @@ def main():
                 pygame.draw.circle(screen, lerp_color(CANVAS_BG, c, 0.6),
                                    (sw_x, sw_y), 8)
 
-        # ---------- 右下角：传感器范围小地图 + 高度计 ----------
+        # ---------- Bottom right: sensor range minimap + height gauge ----------
         pygame.draw.rect(screen, CANVAS_BG, panel, border_radius=10)
         pygame.draw.rect(screen, CANVAS_BORDER, panel, width=1, border_radius=10)
         lab = f_sml.render("SENSOR RANGE", True, TXT_DIM)
         screen.blit(lab, (panel.left + PAD, panel.top + 7))
 
-        # 外框=全部感应范围(边缘为抬笔区)，内框=可作画区
+        # outer box = full sensing range (edges are the pen-up zone), inner box = drawable area
         pygame.draw.rect(screen, lerp_color(CANVAS_BG, AMBER, 0.5), mm_rect, width=1)
         inset = int(OUT_EDGE * MM)
         act = mm_rect.inflate(-2 * inset, -2 * inset)
@@ -922,7 +922,7 @@ def main():
             else:
                 pygame.draw.circle(screen, AMBER, (dx, dy), 5, width=2)
 
-        # Z 高度计：条越高=手越高，越过刻度线=抬笔
+        # Z height gauge: taller bar = higher hand, above the tick line = pen up
         pygame.draw.rect(screen, lerp_color(CANVAS_BG, TXT_DIM, 0.35), gauge, width=1)
         if hand:
             fill_h = int(min(1.0, max(0.0, cur_z)) * MM)
@@ -934,7 +934,7 @@ def main():
         zlab = f_sml.render("Z", True, TXT_DIM)
         screen.blit(zlab, zlab.get_rect(midtop=(gauge.centerx, gauge.bottom + 3)))
 
-        # ---------- 调试(按 D) ----------
+        # ---------- Debug (press D) ----------
         if show_debug:
             dbg = "raw x[%.2f~%.2f] y[%.2f~%.2f]  z=%.2f  fps=%d  ai=%s  snd=%s  flipX=%d flipY=%d swap=%d  g=%d aw=%d cnt=%d" % (
                 raw_range[0], raw_range[1], raw_range[2], raw_range[3],
