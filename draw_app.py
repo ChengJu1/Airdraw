@@ -6,7 +6,7 @@ median + spike gate + 1€ smoothing / out-of-range + jump stroke breaks), and r
 
 Exhibition loop:
   draw -> pen idle and hand away for AI_WAIT_SEC s -> auto-send to AI recognition (Gemini vision) ->
-  text-to-image reconstruction (Pollinations, free) -> fullscreen side-by-side (your doodle vs the AI remake) ->
+  text-to-image reconstruction -> fullscreen side-by-side (your doodle vs the AI remake) ->
   clear after RESULT_SEC s and wait for the next visitor. No network / no key: degrades to plain drawing + auto clear.
 
 Exhibition UI / interaction:
@@ -14,7 +14,7 @@ Exhibition UI / interaction:
   - Live cursor: pen down = solid bright dot, pen up = hollow ring
   - Bottom-right minimap: sensor XY range + out-of-range pen-up zone + current position dot + Z height gauge
   - Gestures: fast flick = clear (armed after a short pen pause); color auto-rotates on every stroke
-  - Sound feedback: pen down/up/clear/color change/recognition done; auto-mutes without a sound card
+  - Sound feedback: pen down/up/clear/recognition done; auto-mutes without a sound card
   - Sensor I2C self-healing: startup failure / mid-run dropout never exits; hardware-reset reconnect loop with an on-screen notice
   - Keyboard (debug): ESC/Q quit  Space/C clear  Enter send to AI now  D debug
     orientation calibration (applies live): X mirror left-right  Y mirror up-down  S swap XY axes
@@ -213,7 +213,7 @@ def _close():
 # ---- Shared drawing / cursor / sensor state ----
 lock = threading.Lock()
 strokes = [[0, []]]            # each element: [palette index, list of points (0..1)]
-color_idx = 0                  # current ink color (AirWheel spin / auto-rotates on pen up)
+color_idx = 0                  # current ink color (auto-rotates on every pen up)
 pen_now = 0
 last_activity = time.time()    # last time a hand was detected
 draw_last = 0.0                # last time a point was actually drawn pen-down (drives the AI trigger)
@@ -389,7 +389,7 @@ def reader():
                         else:
                             with lock:
                                 if strokes and strokes[-1][1]:
-                                    # pen up = start a new stroke, color steps one (AirWheel can adjust)
+                                    # pen up = start a new stroke, color steps one
                                     color_idx = (color_idx + 1) % len(INK_PALETTE)
                                     strokes.append([color_idx, []])
                             cur_x, cur_y = hvx, hvy
@@ -500,16 +500,6 @@ def sf_recognize(png_bytes):
     return _json_from_text(resp["choices"][0]["message"]["content"])
 
 
-def recognize(png_bytes):
-    """Recognition: SiliconFlow first, fall back to Gemini (free tier: only 20/day)."""
-    if SF_KEY:
-        try:
-            return sf_recognize(png_bytes)
-        except Exception as exc:  # noqa: BLE001
-            print("SiliconFlow recognition failed, trying Gemini: %r" % (exc,))
-    return gemini_recognize(png_bytes)
-
-
 def gemini_recognize(png_bytes):
     """Gemini REST vision recognition, returns {"label":..., "prompt":...}."""
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
@@ -527,6 +517,16 @@ def gemini_recognize(png_bytes):
     with urllib.request.urlopen(req, timeout=30) as r:
         resp = json.load(r)
     return json.loads(resp["candidates"][0]["content"]["parts"][0]["text"])
+
+
+def recognize(png_bytes):
+    """Recognition: SiliconFlow first, fall back to Gemini (free tier: only 20/day)."""
+    if SF_KEY:
+        try:
+            return sf_recognize(png_bytes)
+        except Exception as exc:  # noqa: BLE001
+            print("SiliconFlow recognition failed, trying Gemini: %r" % (exc,))
+    return gemini_recognize(png_bytes)
 
 
 def gemini_image(prompt):
