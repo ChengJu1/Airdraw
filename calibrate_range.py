@@ -12,6 +12,7 @@ Then copy the CSV back to the computer for analysis:
     (on the Mac) scp chengju@<pi-ip>:~/captures/cal_*.csv ./data/
 """
 import csv
+import json
 import os
 import sys
 import time
@@ -100,3 +101,17 @@ else:
     print("\nSuggested draw_app.py config (2%%~98%% percentile, excludes edge-clipping spikes):")
     print("    X_LO, X_HI = %.2f, %.2f" % (pct(xs, 2), pct(xs, 98)))
     print("    Y_LO, Y_HI = %.2f, %.2f" % (pct(ys, 2), pct(ys, 98)))
+
+    # Write calibration file, auto-loaded by draw_app.py at startup (saturated-clipping ends clamped into 0.05~0.95)
+    xl, xh = max(pct(xs, 2), 0.05), min(pct(xs, 98), 0.95)
+    yl, yh = max(pct(ys, 2), 0.05), min(pct(ys, 98), 0.95)
+    if xh - xl >= 0.3 and yh - yl >= 0.3:
+        cal = {"X_LO": round(xl, 3), "X_HI": round(xh, 3),
+               "Y_LO": round(yl, 3), "Y_HI": round(yh, 3)}
+        cal_path = os.path.expanduser("~/range_cal.json")
+        with open(cal_path, "w") as jf:
+            json.dump(cal, jf)
+        print("\nwritten to %s (applied automatically when draw_app.py starts):" % cal_path)
+        print("    %s" % json.dumps(cal))
+    else:
+        print("\nUsable range of some axis is below 0.3, calibration file not written -- check sensor/environment and record again.")
