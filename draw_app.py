@@ -10,12 +10,15 @@ Exhibition loop:
   clear after RESULT_SEC s and wait for the next visitor. No network / no key: degrades to plain drawing + auto clear.
 
 Exhibition UI / interaction:
+  - Boots into a tutorial page: how-to steps + hover practice area (live cursor / Z height bar, find your
+    pen-down spot first), forced stay of INTRO_MIN_SEC s, then wave to enter the main screen
   - Dark background, sensor range mapped to a fixed canvas at screen center (cursor goes where the hand goes)
   - Live cursor: pen down = solid bright dot, pen up = hollow ring
   - Bottom-right minimap: sensor XY range + out-of-range pen-up zone + current position dot + Z height gauge
-  - Gestures: fast flick = clear (armed after a short pen pause); color auto-rotates on every stroke
+  - Gestures: fast flick = clear (armed after a short pen pause); ink color rotates per visitor
   - Sound feedback: pen down/up/clear/recognition done; auto-mutes without a sound card
   - Sensor I2C self-healing: startup failure / mid-run dropout never exits; hardware-reset reconnect loop with an on-screen notice
+  - Artwork archive: after each successful AI reconstruction, doodle + result + metadata saved to ~/gallery/
   - Keyboard (debug): ESC/Q quit  Space/C clear  Enter send to AI now  D debug
     orientation calibration (applies live): X mirror left-right  Y mirror up-down  S swap XY axes
 
@@ -28,6 +31,7 @@ Manual run: ~/start_draw.sh
 import array
 import base64
 import csv
+import gc
 import io
 import json
 import math
@@ -55,7 +59,11 @@ OUT_EDGE = 0.08                 # near the edge = pen up; aligned with LO/HI, sa
 Z_HIGH_UP = 0.60
 Z_HIGH_DOWN = 0.50
 MAX_JUMP = 0.07                 # fast-move lead-in lines count as pen up, not drawn (loosened to reduce false breaks)
+# measured on app_20260713_191456: 78% of stroke breaks come from the chip briefly losing tracking (valid drops for <0.5 s):
+# invalid must last longer than this to count as really gone; brief blindness is bridged, no stroke break
+HAND_LOST_HOLD = 0.45
 AUTO_CLEAR_SEC = 8.0            # (fallback when AI is unavailable) auto clear after hand away this long
+INTRO_MIN_SEC = 10.0            # forced stay on the tutorial page; hover in the practice area meanwhile
 
 # ============== Gestures & sound ==============
 FLICK_CLEARS = True             # fast flick = clear canvas
@@ -68,15 +76,19 @@ AI_WAIT_SEC = 3.0               # pen idle and hand away this long => auto-send 
 RESULT_SEC = 15.0               # result display duration, then clear for the next visitor
 MIN_PTS_FOR_AI = 12             # too few total points (accidental touch) => don't send to AI
 G_VISION_MODEL = "gemini-2.5-flash"
-SYS_PROMPT = (
+SYS_PROMPT_BASE = (
     "You are a hand-drawn sketch recognition assistant. The user gives you a very rough monochrome line-drawing trace; "
     "it may be a single object, or a few things combined into one scene. "
     "Decide what was drawn, then write an English prompt for a text-to-image model "
-    "aiming for a clean, recognizable, consistently styled illustration; "
+    "that reimagines it as a beautiful, finished piece of art. "
+    "Choose the art style yourself based on the content; it should fit the subject's mood "
+    "(watercolor, oil painting, flat illustration, pixel art, paper-cut collage, childlike crayon, low poly, "
+    "cyberpunk neon, ukiyo-e... anything works, not limited to these); "
     "if there are multiple elements, blend them naturally into one scene, keeping the original relative layout. "
-    'Output JSON only: {"label": "short english name", "prompt": "english text-to-image prompt"}. '
-    "Both label and prompt must be in English; label at most 4 words. Add "
-    "'simple, clean line illustration, white background, centered' to the prompt."
+    'Output JSON only: {"label": "short english name", "style": "chosen style in english", '
+    '"prompt": "english text-to-image prompt"}. '
+    "label must be at most 4 words; the prompt must reflect the chosen style and include 'high quality, detailed', "
+    "and must not contain words like line drawing / rough sketch / white background."
 )
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -108,7 +120,7 @@ TXT_DIM = (108, 118, 142)
 GREEN = (90, 220, 160)          # pen down / drawable state
 AMBER = (255, 190, 90)          # pen up / boundary warning
 LINE_W = 5
-INK_PALETTE = [                 # color auto-rotates on every pen up
+INK_PALETTE = [                 # ink colors, rotates one per visitor (fixed within a session)
     (240, 242, 248),            # bright white
     (120, 200, 255),            # sky blue
     (140, 235, 190),            # mint
@@ -193,9 +205,10 @@ def build_sounds():
     }
 
 
-# ---- CSV ----
+# ---- CSV / artwork archive ----
 name = sys.argv[1] if len(sys.argv) > 1 else time.strftime("app_%Y%m%d_%H%M%S")
 outdir = os.path.expanduser("~/captures"); os.makedirs(outdir, exist_ok=True)
+gallery_dir = os.path.expanduser("~/gallery"); os.makedirs(gallery_dir, exist_ok=True)
 csv_path = os.path.join(outdir, name + ".csv")
 csv_file = open(csv_path, "w", newline="")
 csv_writer = csv.writer(csv_file)
@@ -242,6 +255,18 @@ ai = {
     "err_t": 0.0,
     "_cache": None,            # scaled result cache
 }
+recent_styles = []             # image styles of the last few visitors, nudges the model to vary (guarded by ai_lock)
+
+
+def build_sys_prompt():
+    """Base prompt + blacklist of recently used styles, so each visitor gets a different style."""
+    with ai_lock:
+        used = list(recent_styles)
+    p = SYS_PROMPT_BASE
+    if used:
+        p += ("Recent visitors already got these styles: %s. "
+              "Pick a clearly different style this time." % ", ".join(used))
+    return p
 
 
 def clear_canvas():
@@ -252,15 +277,41 @@ def clear_canvas():
     draw_last = 0.0
 
 
+def session_reset():
+    """End of one visitor's run: clear canvas + rotate ink color + release last
+    round's AI images + flush data to disk + garbage collect.
+
+    The exhibition runs all day; each wrap-up frees memory and writes data to
+    the card, keeping the memory curve flat and recordings safe across power loss.
+    """
+    global color_idx
+    color_idx = (color_idx + 1) % len(INK_PALETTE)   # next visitor gets a new color
+    clear_canvas()
+    with ai_lock:
+        ai["img"] = None       # last visitor's generated/sketch Surfaces, free the memory
+        ai["sketch"] = None
+        ai["_cache"] = None
+        ai["label"] = ""
+    raw_range[0], raw_range[1] = 1.0, 0.0     # reset debug range per visitor
+    raw_range[2], raw_range[3] = 1.0, 0.0
+    try:
+        csv_file.flush()
+        os.fsync(csv_file.fileno())            # force to disk, survives pulling the plug
+    except Exception:
+        pass
+    gc.collect()
+
+
 def reader():
     """Sensor reader thread: I2C self-healing + gestures + filtering into strokes."""
     global sensor, sensor_ok
-    global pen_now, last_activity, draw_last, prev_pen, color_idx
+    global pen_now, last_activity, draw_last, prev_pen
     global cur_x, cur_y, cur_z, cur_seen
     last_ts = None
     last_draw = None
     last_flick = 0.0
     z_hist = []                # 3-point median window on z, kills false breaks from single-frame spikes
+    invalid_since = None       # when the chip started reporting "no hand" (for bridging brief blindness)
     err_streak = 0
     last_frame_t = time.time()
     cnt = 0
@@ -320,11 +371,12 @@ def reader():
                             now - last_flick > FLICK_DEBOUNCE:
                         last_flick = now
                         ai_cancel()
-                        clear_canvas()
+                        session_reset()
                         snd("clear")
                         print("gesture: flick clear (code=%d)" % gest)
 
                     if valid:
+                        invalid_since = None
                         raw_range[0] = min(raw_range[0], rx); raw_range[1] = max(raw_range[1], rx)
                         raw_range[2] = min(raw_range[2], ry); raw_range[3] = max(raw_range[3], ry)
 
@@ -389,9 +441,7 @@ def reader():
                         else:
                             with lock:
                                 if strokes and strokes[-1][1]:
-                                    # pen up = start a new stroke, color steps one
-                                    color_idx = (color_idx + 1) % len(INK_PALETTE)
-                                    strokes.append([color_idx, []])
+                                    strokes.append([color_idx, []])   # pen up = start a new stroke
                             cur_x, cur_y = hvx, hvy
                         cur_z = rz
                         cur_seen = time.time()
@@ -401,20 +451,25 @@ def reader():
                         csv_writer.writerow(["%.4f" % t, "%.5f" % rx, "%.5f" % ry,
                                              "%.5f" % rz, 1, pen])
                     else:
-                        if prev_pen:
-                            snd("up")
-                        pen_now = 0
-                        prev_pen = 0
-                        zpen.reset()
-                        reset_filters()
-                        hx.reset()
-                        hy.reset()
-                        z_hist.clear()
-                        last_draw = None
-                        with lock:
-                            if strokes and strokes[-1][1]:
-                                color_idx = (color_idx + 1) % len(INK_PALETTE)
-                                strokes.append([color_idx, []])
+                        # measured: 78% of breaks come from <0.5 s brief "blindness": bridge it first,
+                        # keep the pen state and pause drawing; only a sustained timeout counts as really gone, formal break.
+                        # if the position jumped far on recovery, the MAX_JUMP guard breaks the stroke as a fallback
+                        if invalid_since is None:
+                            invalid_since = time.time()
+                        if time.time() - invalid_since > HAND_LOST_HOLD:
+                            if prev_pen:
+                                snd("up")
+                            pen_now = 0
+                            prev_pen = 0
+                            zpen.reset()
+                            reset_filters()
+                            hx.reset()
+                            hy.reset()
+                            z_hist.clear()
+                            last_draw = None
+                            with lock:
+                                if strokes and strokes[-1][1]:
+                                    strokes.append([color_idx, []])
                         csv_writer.writerow(["%.4f" % t, "", "", "", 0, 0])
                     cnt += 1
                     if cnt % 50 == 0:
@@ -480,7 +535,7 @@ def sf_recognize(png_bytes):
     body = {
         "model": SF_VISION_MODEL,
         "messages": [
-            {"role": "system", "content": SYS_PROMPT},
+            {"role": "system", "content": build_sys_prompt()},
             {"role": "user", "content": [
                 {"type": "image_url",
                  "image_url": {"url": "data:image/png;base64," + b64}},
@@ -500,6 +555,17 @@ def sf_recognize(png_bytes):
     return _json_from_text(resp["choices"][0]["message"]["content"])
 
 
+def _post_json(url, body, headers, timeout=30):
+    """POST JSON and parse the response; on HTTP error include the body in the exception for easier debugging."""
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("HTTP %d: %s" % (e.code, e.read().decode()[:300])) from None
+
+
 def gemini_recognize(png_bytes):
     """Gemini REST vision recognition, returns {"label":..., "prompt":...}."""
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
@@ -508,14 +574,14 @@ def gemini_recognize(png_bytes):
         "contents": [{"parts": [
             {"inline_data": {"mime_type": "image/png",
                              "data": base64.b64encode(png_bytes).decode()}},
-            {"text": SYS_PROMPT + "\nThis is a rough trace. Identify it and give the prompt."},
+            {"text": build_sys_prompt() + "\nThis is a rough trace. Identify it and give the prompt."},
         ]}],
         "generationConfig": {"response_mime_type": "application/json"},
     }
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        resp = json.load(r)
+    resp = _post_json(url, body, {"Content-Type": "application/json"})
+    if "candidates" not in resp:
+        # 200 but no result: usually safety block / quota issue, dump the raw response
+        raise ValueError("Gemini no candidates: %s" % json.dumps(resp)[:300])
     return json.loads(resp["candidates"][0]["content"]["parts"][0]["text"])
 
 
@@ -535,10 +601,9 @@ def gemini_image(prompt):
            "%s:generateContent?key=%s" % (G_IMAGE_MODEL, GEMINI_KEY))
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        resp = json.load(r)
+    resp = _post_json(url, body, {"Content-Type": "application/json"}, timeout=60)
+    if "candidates" not in resp:
+        raise ValueError("Gemini no candidates: %s" % json.dumps(resp)[:300])
     for p in resp["candidates"][0]["content"]["parts"]:
         if "inlineData" in p:
             return base64.b64decode(p["inlineData"]["data"])
@@ -613,9 +678,32 @@ def ai_worker(snap, token):
         png, surf = sketch_png(snap)
         info = recognize(png)
         label = str(info.get("label", "?"))
+        style = str(info.get("style", "")).strip()
+        if style:
+            with ai_lock:
+                recent_styles.append(style)
+                del recent_styles[:-4]         # keep only the last 4
         prompt = info.get("prompt") or (
-            "simple, clean line illustration of a %s, white background, centered" % label)
+            "beautiful detailed digital illustration of a %s, "
+            "vibrant colors, soft lighting, high quality" % label)
         img_bytes = generate_image(prompt)
+
+        # artwork archive: doodle + result + metadata (thesis evaluation data / website gallery material). Failure doesn't affect the show
+        try:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            safe = "".join(c if c.isalnum() else "_" for c in label)[:24] or "x"
+            base = os.path.join(gallery_dir, "%s_%s" % (stamp, safe))
+            with open(base + "_sketch.png", "wb") as f:
+                f.write(png)
+            art_ext = ".png" if img_bytes[:4] == b"\x89PNG" else ".jpg"
+            with open(base + "_art" + art_ext, "wb") as f:
+                f.write(img_bytes)
+            with open(base + ".json", "w") as f:
+                json.dump({"time": stamp, "label": label, "style": style,
+                           "prompt": prompt}, f, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            print("artwork archive failed (show unaffected): %r" % (exc,))
+
         hint = "img.png" if img_bytes[:4] == b"\x89PNG" else "img.jpg"
         img = pygame.image.load(io.BytesIO(img_bytes), hint)
         with ai_lock:
@@ -688,6 +776,9 @@ def main():
 
     trigger_draw_last = -1.0    # draw_last at AI trigger time; drawing after that cancels
     show_debug = False
+    intro = True                # boot tutorial page (wave to start)
+    intro_enter_t = None        # when the wave check started (must persist 0.4 s)
+    intro_t0 = time.time()      # tutorial page start time (forced stay INTRO_MIN_SEC)
     running = True
     while running:
         now = time.time()
@@ -700,9 +791,12 @@ def main():
             elif ev.type == pygame.KEYDOWN:
                 if ev.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
+                elif intro and ev.key in (pygame.K_SPACE, pygame.K_RETURN):
+                    intro = False               # debug: skip the tutorial page
+                    session_reset()
                 elif ev.key in (pygame.K_SPACE, pygame.K_c):
                     ai_cancel()
-                    clear_canvas()
+                    session_reset()
                     snd("clear")
                 elif ev.key == pygame.K_d:
                     show_debug = not show_debug
@@ -721,8 +815,103 @@ def main():
                         ai_trigger(snap_now)
                         mode = "thinking"
 
-        hand = (now - cur_seen) < 0.35          # valid frame recently => hand in range
+        hand = (now - cur_seen) < HAND_LOST_HOLD + 0.05   # hand in range (aligned with the blindness bridge window)
         idle = now - last_activity
+
+        # ---------- Boot tutorial page: steps + hover practice, wave to start after the timer ----------
+        if intro:
+            ready = (now - intro_t0) >= INTRO_MIN_SEC   # forced to read the steps
+            if ready and sensor_ok and hand:
+                if intro_enter_t is None:
+                    intro_enter_t = now
+                if now - intro_enter_t > 0.4:   # hand present for 0.4 s = wave confirmed
+                    intro = False
+                    session_reset()
+                    snd("success")
+            else:
+                intro_enter_t = None
+
+            screen.fill(BG)
+            ccx = W // 2
+            t1 = f_big.render("S K Y W R I T E R", True, TXT)
+            screen.blit(t1, t1.get_rect(center=(ccx, int(H * 0.12))))
+            t2 = f_mid.render("draw in the air - no pen, no touch", True, TXT_DIM)
+            screen.blit(t2, t2.get_rect(center=(ccx, int(H * 0.12) + 48)))
+
+            # left column: four steps
+            x0 = int(W * 0.10)
+            y = int(H * 0.32)
+            for num, col, head, body in (
+                    ("1", GREEN, "HOVER",
+                     "hold your hand above the sensor - a cursor follows you"),
+                    ("2", AMBER, "DRAW",
+                     "Z bar below the line = pen down, raise to lift"),
+                    ("3", (120, 200, 255), "STEADY",
+                     "move slowly, keep your hand steady - smooth lines"),
+                    ("4", (210, 160, 255), "FINISH",
+                     "step away - the AI reimagines your sketch"),
+            ):
+                pygame.draw.circle(screen, col, (x0, y), 17)
+                n = f_mid.render(num, True, BG)
+                screen.blit(n, n.get_rect(center=(x0, y)))
+                h = f_mid.render(head, True, col)
+                screen.blit(h, (x0 + 36, y - 24))
+                b = f_sml.render(body, True, TXT_DIM)
+                screen.blit(b, (x0 + 36, y + 6))
+                y += int(H * 0.10)
+
+            # right side: hover practice area (same logic as the main screen) -- find your pen-down spot first
+            pb = int(H * 0.36)
+            pr = pygame.Rect(0, 0, pb, pb)
+            pr.center = (int(W * 0.72), int(H * 0.50))
+            pygame.draw.rect(screen, CANVAS_BG, pr, border_radius=12)
+            pygame.draw.rect(screen, CANVAS_BORDER, pr, width=2, border_radius=12)
+            plab = f_sml.render("TRY IT - hover to find your spot", True, TXT_DIM)
+            screen.blit(plab, plab.get_rect(midtop=(pr.centerx, pr.top - 28)))
+            if sensor_ok and hand:
+                dx = pr.left + int(cur_x * pb)
+                dy = pr.top + int(cur_y * pb)
+                if pen_now:
+                    pygame.draw.circle(screen, GREEN, (dx, dy), 8)
+                else:
+                    pygame.draw.circle(screen, AMBER, (dx, dy), 10, width=2)
+                    pygame.draw.circle(screen, AMBER, (dx, dy), 2)
+            # Z height bar next to the practice area: visitors see "below the line = pen down" at a glance
+            zg = pygame.Rect(pr.right + 18, pr.top, 16, pb)
+            pygame.draw.rect(screen, lerp_color(CANVAS_BG, TXT_DIM, 0.35), zg, width=1)
+            if sensor_ok and hand:
+                fh = int(min(1.0, max(0.0, cur_z)) * pb)
+                bar = pygame.Rect(zg.left + 2, zg.bottom - fh, 12, max(0, fh - 2))
+                pygame.draw.rect(screen, GREEN if pen_now else AMBER, bar)
+            ty = zg.bottom - int(Z_HIGH_UP * pb)
+            pygame.draw.line(screen, TXT, (zg.left - 4, ty), (zg.right + 4, ty))
+            zl = f_sml.render("Z", True, TXT_DIM)
+            screen.blit(zl, zl.get_rect(midtop=(zg.centerx, zg.bottom + 4)))
+
+            # bottom: connecting / countdown / wave to start
+            by = int(H * 0.88)
+            if not sensor_ok:
+                m = f_mid.render("sensor connecting...", True, AMBER)
+                screen.blit(m, m.get_rect(center=(ccx, by)))
+            elif not ready:
+                left_s = int(INTRO_MIN_SEC - (now - intro_t0) + 0.99)
+                m = f_mid.render("read the steps - starting in %d..." % left_s,
+                                 True, TXT_DIM)
+                screen.blit(m, m.get_rect(center=(ccx, by)))
+            else:
+                pulse = 0.5 + 0.5 * math.sin(now * 4.0)
+                for k in (0.0, 0.5):
+                    ph_ = ((now * 0.5 + k) % 1.0)
+                    rr = int(12 + ph_ * 40)
+                    col = lerp_color(BG, GREEN, max(0.0, 0.6 * (1.0 - ph_)))
+                    pygame.draw.circle(screen, col, (ccx, by - 34), rr, width=2)
+                m = f_big.render("WAVE TO START", True,
+                                 lerp_color(TXT_DIM, TXT, pulse))
+                screen.blit(m, m.get_rect(center=(ccx, by + 24)))
+
+            pygame.display.flip()
+            clock.tick(60)
+            continue
 
         with lock:
             snap = [(ci, list(s)) for ci, s in strokes if len(s) >= 2]
@@ -731,15 +920,18 @@ def main():
 
         # ---------- State machine ----------
         if mode == "draw":
-            # pen idle + hand away => auto-send to AI; fallback auto clear if AI unavailable
+            # pen idle + hand away => auto-send to AI. Each drawing is sent once (unchanged
+            # draw_last means it was sent and failed, don't retry and burn quota); failed/AI unavailable => fallback auto clear
             if AI_ENABLED and n_pts >= MIN_PTS_FOR_AI and not hand \
-                    and draw_last > 0 and now - draw_last > AI_WAIT_SEC:
+                    and draw_last > 0 and now - draw_last > AI_WAIT_SEC \
+                    and draw_last != trigger_draw_last:
                 trigger_draw_last = draw_last
                 ai_trigger(snap)
                 mode = "thinking"
             elif has_content and idle > AUTO_CLEAR_SEC and \
-                    (not AI_ENABLED or n_pts < MIN_PTS_FOR_AI):
-                clear_canvas()
+                    (not AI_ENABLED or n_pts < MIN_PTS_FOR_AI
+                     or draw_last == trigger_draw_last):
+                session_reset()
         elif mode == "thinking":
             if draw_last != trigger_draw_last:   # visitor came back and drew => cancel this run
                 ai_cancel()
@@ -749,7 +941,7 @@ def main():
                 shown = now - ai["t0"]
             if shown > RESULT_SEC or pen_now:    # time's up / someone starts drawing => clear and restart
                 ai_cancel()
-                clear_canvas()
+                session_reset()
                 mode = "draw"
 
         # ---------- Result page ----------
@@ -889,7 +1081,7 @@ def main():
         lab = f_sml.render("GESTURES", True, TXT_DIM)
         screen.blit(lab, (hint_panel.left + PAD, hint_panel.top + 7))
         h1 = f_sml.render("fast swipe (hand raised)  =  clear", True, TXT)
-        h2 = f_sml.render("every new stroke  =  new colour", True, TXT)
+        h2 = f_sml.render("step away when done  =  AI redraws it", True, TXT)
         screen.blit(h1, (hint_panel.left + PAD, hint_panel.top + 32))
         screen.blit(h2, (hint_panel.left + PAD, hint_panel.top + 56))
         # palette: current color enlarged with a ring
