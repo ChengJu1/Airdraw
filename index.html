@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Airdraw — draw in the air</title>
+  <meta name="description" content="An interactive installation: draw in mid-air above an electric-field sensor, and watch AI reimagine your sketch. Designed for many hands drawing together across multiple devices." />
+  <style>
+    :root {
+      --blue: #2997ff;
+      --blue-btn: #0071e3;
+      --ink-dark: #f5f5f7;      /* text on dark sections */
+      --dim-dark: #86868b;
+      --ink-light: #1d1d1f;     /* text on light sections */
+      --dim-light: #6e6e73;
+      --bg-light: #f5f5f7;
+      --card-light: #ffffff;
+      --sky: #78c8ff;
+      --mint: #8cebbe;
+      --amber: #fac878;
+      --lavender: #d2a0ff;
+      --coral: #ff96a5;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+                   "Helvetica Neue", "Segoe UI", Arial, sans-serif;
+      background: #000;
+      color: var(--ink-dark);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .wrap { max-width: 980px; margin: 0 auto; padding: 0 22px; }
+
+    /* ---------- nav ---------- */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      height: 48px;
+      display: flex;
+      align-items: center;
+      background: rgba(22, 22, 23, 0.8);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+    }
+
+    nav .bar {
+      width: 100%;
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 0 22px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    nav .name {
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--ink-dark);
+      text-decoration: none;
+      letter-spacing: -0.01em;
+    }
+
+    nav .links { display: flex; align-items: center; gap: 26px; }
+
+    nav .links a {
+      font-size: 12px;
+      color: rgba(245, 245, 247, 0.8);
+      text-decoration: none;
+      transition: color 0.2s ease;
+    }
+
+    nav .links a:hover { color: #fff; }
+
+    nav .pill {
+      font-size: 12px;
+      color: #fff !important;
+      background: var(--blue-btn);
+      padding: 4px 13px;
+      border-radius: 980px;
+    }
+
+    nav .pill:hover { background: #0077ed; }
+
+    @media (max-width: 720px) { nav .links a:not(.pill) { display: none; } }
+
+    /* ---------- typography ---------- */
+    .eyebrow {
+      font-size: 19px;
+      font-weight: 600;
+      color: var(--dim-dark);
+      margin-bottom: 10px;
+      letter-spacing: -0.01em;
+    }
+
+    .headline {
+      font-size: clamp(40px, 7.5vw, 80px);
+      font-weight: 700;
+      letter-spacing: -0.025em;
+      line-height: 1.05;
+    }
+
+    .subhead {
+      font-size: clamp(19px, 2.6vw, 28px);
+      font-weight: 400;
+      letter-spacing: -0.01em;
+      max-width: 30em;
+      margin: 18px auto 0;
+    }
+
+    .link-more {
+      font-size: 19px;
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    .link-more:hover { text-decoration: underline; }
+
+    .link-row { display: flex; gap: 34px; justify-content: center; margin-top: 26px; }
+
+    /* ---------- scroll reveal ---------- */
+    .reveal { opacity: 0; transform: translateY(22px); transition: opacity 0.8s ease, transform 0.8s ease; }
+    .reveal.in { opacity: 1; transform: none; }
+
+    /* ---------- hero ---------- */
+    header { text-align: center; padding: 88px 22px 100px; overflow: hidden; }
+
+    header .eyebrow { animation: rise 0.8s ease both; }
+
+    header h1 {
+      font-size: clamp(48px, 9.5vw, 96px);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.03;
+      animation: rise 0.8s 0.1s ease both;
+    }
+
+    header h1 .grad {
+      background: linear-gradient(95deg, var(--sky), var(--mint) 32%, var(--amber) 56%, var(--lavender) 78%, var(--coral));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    header .subhead { color: var(--dim-dark); animation: rise 0.8s 0.2s ease both; }
+
+    header .link-row { animation: rise 0.8s 0.3s ease both; }
+
+    /* installation display frame */
+    .display {
+      position: relative;
+      max-width: 880px;
+      margin: 64px auto 0;
+      border-radius: 28px;
+      overflow: hidden;
+      background: #0a0c12;
+      border: 1px solid #2a2a2e;
+      box-shadow: 0 40px 120px rgba(0, 0, 0, 0.8);
+      aspect-ratio: 16 / 9;
+      animation: rise 1s 0.4s ease both;
+    }
+
+    .display canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+    .display .badge {
+      position: absolute;
+      left: 50%;
+      bottom: 18px;
+      transform: translateX(-50%);
+      font-size: 12px;
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: rgba(245, 245, 247, 0.4);
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(26px); }
+      to   { opacity: 1; transform: none; }
+    }
+
+    /* ---------- alternating sections ---------- */
+    section { padding: 120px 0; text-align: center; }
+
+    section.light { background: var(--bg-light); color: var(--ink-light); }
+    section.light .eyebrow { color: var(--dim-light); }
+    section.light .subhead { color: var(--dim-light); }
+    section.light .link-more { color: #0066cc; }
+
+    section.dark { background: #000; }
+    section.dark .subhead { color: var(--dim-dark); }
+
+    /* ---------- bento grid ---------- */
+    .bento {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 18px;
+      margin-top: 60px;
+      text-align: left;
+    }
+
+    .bcard {
+      background: var(--card-light);
+      border-radius: 28px;
+      padding: 36px 32px;
+      grid-column: span 2;
+      transition: transform 0.3s ease, box-shadow 0.3s ease;
+    }
+
+    .bcard:hover { transform: translateY(-4px); box-shadow: 0 18px 50px rgba(0, 0, 0, 0.08); }
+
+    .bcard.wide { grid-column: span 3; }
+
+    .bcard h3 { font-size: 24px; font-weight: 600; letter-spacing: -0.015em; margin: 18px 0 8px; }
+
+    .bcard p { font-size: 15.5px; color: var(--dim-light); }
+
+    .bcard .glyph { height: 44px; display: flex; align-items: center; }
+
+    @media (max-width: 720px) {
+      .bento { grid-template-columns: 1fr; }
+      .bcard, .bcard.wide { grid-column: span 1; }
+      section { padding: 80px 0; }
+    }
+
+    /* ---------- demo video ---------- */
+    .video-frame {
+      position: relative;
+      max-width: 880px;
+      margin: 60px auto 0;
+      border-radius: 28px;
+      overflow: hidden;
+      border: 1px solid #2a2a2e;
+      background:
+        radial-gradient(ellipse at 30% 20%, rgba(43, 110, 166, 0.2), transparent 55%),
+        radial-gradient(ellipse at 75% 85%, rgba(106, 74, 158, 0.18), transparent 55%),
+        #0a0c12;
+      aspect-ratio: 16 / 9;
+      box-shadow: 0 40px 120px rgba(0, 0, 0, 0.7);
+    }
+
+    .video-frame video, .video-frame iframe {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      object-fit: cover;
+    }
+
+    /* portrait video in a narrow centered frame */
+    .video-frame.portrait {
+      aspect-ratio: 9 / 16;
+      max-width: min(400px, 86vw);
+    }
+
+    /* ---------- sample gallery ---------- */
+    .gallery {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      margin-top: 56px;
+      text-align: left;
+    }
+
+    .gcard { margin: 0; }
+
+    .gcard img {
+      width: 100%;
+      display: block;
+      border-radius: 18px;
+    }
+
+    .gcard .sk {
+      border: 1px solid #2a2a2e;
+      background: #fff;
+    }
+
+    .gcard .arrow {
+      text-align: center;
+      color: #86868b;
+      font-size: 22px;
+      margin: 10px 0;
+    }
+
+    .gcard figcaption {
+      margin-top: 14px;
+      font-size: 14px;
+      color: #86868b;
+      text-align: center;
+    }
+
+    .gcard figcaption b {
+      color: #f5f5f7;
+      font-weight: 600;
+      display: block;
+      font-size: 16px;
+      margin-bottom: 2px;
+    }
+
+    @media (max-width: 720px) { .gallery { grid-template-columns: 1fr; } }
+
+    /* ---------- vision ---------- */
+    .vision-card {
+      max-width: 880px;
+      margin: 60px auto 0;
+      background: #0a0c12;
+      border-radius: 28px;
+      padding: 46px 40px 34px;
+      box-shadow: 0 30px 80px rgba(0, 0, 0, 0.25);
+    }
+
+    .vision-svg { width: 100%; height: auto; display: block; }
+
+    .flow { stroke-dasharray: 6 9; animation: flow 1.4s linear infinite; }
+
+    @keyframes flow { to { stroke-dashoffset: -15; } }
+
+    .footnote {
+      font-size: 13.5px;
+      color: var(--dim-light);
+      max-width: 44em;
+      margin: 34px auto 0;
+    }
+
+    /* ---------- tech ---------- */
+    .tech-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 44px;
+      margin-top: 64px;
+      text-align: left;
+    }
+
+    .tech-grid h3 {
+      font-size: 21px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      margin-bottom: 10px;
+    }
+
+    .tech-grid h3 span { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+
+    .tech-grid > div:nth-child(1) h3 span { color: var(--sky); }
+    .tech-grid > div:nth-child(2) h3 span { color: var(--mint); }
+    .tech-grid > div:nth-child(3) h3 span { color: var(--lavender); }
+
+    .tech-grid p { font-size: 15.5px; color: var(--dim-dark); }
+
+    @media (max-width: 720px) { .tech-grid { grid-template-columns: 1fr; gap: 34px; } }
+
+    /* ---------- footer ---------- */
+    footer {
+      background: var(--bg-light);
+      color: var(--dim-light);
+      font-size: 12px;
+      border-top: 1px solid #d2d2d7;
+      padding: 22px 0 40px;
+    }
+
+    footer .wrap {
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    footer a { color: #424245; text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+      .reveal { opacity: 1; transform: none; }
+      html { scroll-behavior: auto; }
+    }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <div class="bar">
+      <a class="name" href="#top">Airdraw</a>
+      <div class="links">
+        <a href="#how">Overview</a>
+        <a href="#demo">Demo</a>
+        <a href="#vision">Vision</a>
+        <a href="#tech">Tech</a>
+        <a class="pill" href="https://github.com/ChengJu1/Airdraw">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <header id="top">
+    <div class="eyebrow">Airdraw</div>
+    <h1>Draw in the air.<br /><span class="grad">Watch AI reimagine it.</span></h1>
+    <p class="subhead">
+      An interactive installation you play with your bare hand.
+      No pen. No touch. Just air.
+    </p>
+    <div class="link-row">
+      <a class="link-more" href="#how">See how it works &gt;</a>
+      <a class="link-more" href="https://github.com/ChengJu1/Airdraw">View the source &gt;</a>
+    </div>
+
+    <div class="display">
+      <canvas id="sky"></canvas>
+      <div class="badge">Live from the installation</div>
+    </div>
+  </header>
+
+  <section class="light" id="how">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="eyebrow">How it works</div>
+        <h2 class="headline">Wave. Draw.<br />Reimagine.</h2>
+        <p class="subhead">
+          A weak electric field hangs above the sensor. Your hand bends it,
+          and the installation turns that into light.
+        </p>
+      </div>
+
+      <div class="bento">
+        <div class="bcard wide reveal">
+          <div class="glyph">
+            <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
+              <circle cx="22" cy="30" r="4" fill="#78c8ff"/>
+              <path d="M10 18 Q 22 6 34 18" stroke="#78c8ff" stroke-width="2.5" stroke-linecap="round" fill="none" opacity="0.5"/>
+              <path d="M13 23 Q 22 14 31 23" stroke="#78c8ff" stroke-width="2.5" stroke-linecap="round" fill="none" opacity="0.75"/>
+            </svg>
+          </div>
+          <h3>Hover to begin.</h3>
+          <p>Hold your hand above the board and a cursor appears, following your
+             every move — the field sees you before you touch anything.</p>
+        </div>
+
+        <div class="bcard wide reveal" style="transition-delay: 0.08s">
+          <div class="glyph">
+            <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
+              <path d="M8 32 C 14 12, 26 40, 36 14" stroke="#8cebbe" stroke-width="3" stroke-linecap="round" fill="none"/>
+            </svg>
+          </div>
+          <h3>Lower your hand to draw.</h3>
+          <p>Drop your hand and the pen touches down: movement becomes glowing ink.
+             Raise it to lift the pen between strokes.</p>
+        </div>
+
+        <div class="bcard reveal">
+          <div class="glyph">
+            <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
+              <circle cx="22" cy="22" r="12" stroke="#d2a0ff" stroke-width="2.5" fill="none" stroke-dasharray="4 6" stroke-linecap="round"/>
+              <circle cx="22" cy="22" r="4" fill="#d2a0ff"/>
+            </svg>
+          </div>
+          <h3>Circle for colour.</h3>
+          <p>Raise your hand and draw a little circle in the air — the ink changes colour.</p>
+        </div>
+
+        <div class="bcard reveal" style="transition-delay: 0.08s">
+          <div class="glyph">
+            <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
+              <path d="M8 22 H 32" stroke="#fac878" stroke-width="3" stroke-linecap="round"/>
+              <path d="M26 14 L 34 22 L 26 30" stroke="#fac878" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+            </svg>
+          </div>
+          <h3>Swipe to clear.</h3>
+          <p>Flick your hand across the field and the canvas wipes itself clean.</p>
+        </div>
+
+        <div class="bcard reveal" style="transition-delay: 0.16s">
+          <div class="glyph">
+            <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
+              <path d="M22 8 L 24.5 17 L 34 19.5 L 24.5 22 L 22 31 L 19.5 22 L 10 19.5 L 19.5 17 Z" fill="#ff96a5"/>
+              <circle cx="33" cy="31" r="3" fill="#ff96a5" opacity="0.6"/>
+            </svg>
+          </div>
+          <h3>Step back. AI takes over.</h3>
+          <p>The AI studies your sketch, names it, and paints its own version —
+             shown side by side with yours.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="dark" id="demo">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="eyebrow">Demo</div>
+        <h2 class="headline">See it in action.</h2>
+      </div>
+
+      <div class="video-frame portrait reveal">
+        <video src="demo.mp4" controls playsinline muted autoplay loop
+               preload="metadata"></video>
+      </div>
+
+      <p class="subhead reveal" style="margin-top: 88px;">
+        Real pairs from the installation — a sketch drawn in mid-air,
+        and what the AI made of it.
+      </p>
+
+      <div class="gallery">
+        <figure class="gcard reveal">
+          <img class="sk" src="samples/sample1_sketch.png"
+               alt="Mid-air sketch of a bird-like outline" loading="lazy" />
+          <div class="arrow">&#8595;</div>
+          <img src="samples/sample1_art.jpg"
+               alt="AI reconstruction: a crane in ink wash style" loading="lazy" />
+          <figcaption><b>Graceful Bird</b>ink wash painting</figcaption>
+        </figure>
+
+        <figure class="gcard reveal" style="transition-delay: 0.08s">
+          <img class="sk" src="samples/sample2_sketch.png"
+               alt="Mid-air sketch of overlapping circles" loading="lazy" />
+          <div class="arrow">&#8595;</div>
+          <img src="samples/sample2_art.jpg"
+               alt="AI reconstruction: an abstract expressionist face" loading="lazy" />
+          <figcaption><b>Abstract Face</b>abstract expressionism</figcaption>
+        </figure>
+
+        <figure class="gcard reveal" style="transition-delay: 0.16s">
+          <img class="sk" src="samples/sample3_sketch.png"
+               alt="Mid-air sketch of a spiral" loading="lazy" />
+          <div class="arrow">&#8595;</div>
+          <img src="samples/sample3_art.jpg"
+               alt="AI reconstruction: a glowing cyclone digital painting" loading="lazy" />
+          <figcaption><b>Abstract Cyclone</b>dynamic digital painting</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <section class="light" id="vision">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="eyebrow">The vision</div>
+        <h2 class="headline">One canvas.<br />Many hands.</h2>
+        <p class="subhead">
+          Every sensor is a doorway onto the same shared canvas. Different stations,
+          different rooms, different cities — one picture, drawn together, then
+          reimagined by AI as a single artwork no one made alone.
+        </p>
+      </div>
+
+      <div class="vision-card reveal">
+        <svg class="vision-svg" viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img"
+             aria-label="Three sensor stations feeding strokes into one shared canvas">
+          <!-- shared canvas -->
+          <rect x="220" y="18" width="280" height="150" rx="14"
+                fill="#11141e" stroke="#363e58" stroke-width="2"/>
+          <text x="360" y="44" fill="#6c768e" font-size="12" letter-spacing="3"
+                text-anchor="middle" font-family="-apple-system, sans-serif">SHARED CANVAS</text>
+          <!-- three visitors' strokes woven together -->
+          <path d="M 258 120 C 285 75, 320 75, 345 108 S 400 140, 425 100"
+                fill="none" stroke="#78c8ff" stroke-width="4" stroke-linecap="round"/>
+          <path d="M 275 140 C 320 95, 380 130, 415 82 S 455 70, 468 92"
+                fill="none" stroke="#8cebbe" stroke-width="4" stroke-linecap="round"/>
+          <path d="M 300 70 C 340 120, 390 60, 440 128"
+                fill="none" stroke="#ff96a5" stroke-width="4" stroke-linecap="round"/>
+
+          <!-- data flowing into the canvas -->
+          <path class="flow" d="M 120 236 C 130 205, 200 190, 250 172"
+                fill="none" stroke="#78c8ff" stroke-width="2" opacity="0.7"/>
+          <path class="flow" d="M 360 236 L 360 172"
+                fill="none" stroke="#8cebbe" stroke-width="2" opacity="0.7"/>
+          <path class="flow" d="M 600 236 C 590 205, 520 190, 470 172"
+                fill="none" stroke="#ff96a5" stroke-width="2" opacity="0.7"/>
+
+          <!-- three sensor stations -->
+          <g font-family="-apple-system, sans-serif" font-size="11" text-anchor="middle">
+            <rect x="75" y="240" width="90" height="42" rx="10"
+                  fill="#11141e" stroke="#363e58" stroke-width="1.5"/>
+            <circle cx="120" cy="255" r="5" fill="#78c8ff"/>
+            <text x="120" y="274" fill="#6c768e">station 1</text>
+
+            <rect x="315" y="240" width="90" height="42" rx="10"
+                  fill="#11141e" stroke="#363e58" stroke-width="1.5"/>
+            <circle cx="360" cy="255" r="5" fill="#8cebbe"/>
+            <text x="360" y="274" fill="#6c768e">station 2</text>
+
+            <rect x="555" y="240" width="90" height="42" rx="10"
+                  fill="#11141e" stroke="#363e58" stroke-width="1.5"/>
+            <circle cx="600" cy="255" r="5" fill="#ff96a5"/>
+            <text x="600" y="274" fill="#6c768e">station 3</text>
+          </g>
+        </svg>
+      </div>
+
+      <p class="footnote reveal">
+        On show today: a single station — the first node of that network, with the
+        full sensing, drawing and AI pipeline running end to end.
+      </p>
+    </div>
+  </section>
+
+  <section class="dark" id="tech">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="eyebrow">Under the hood</div>
+        <h2 class="headline">Field lines.<br />Filters. Models.</h2>
+      </div>
+
+      <div class="tech-grid">
+        <div class="reveal">
+          <h3><span>SENSING</span>No camera. No wearable.</h3>
+          <p>The Skywriter board projects a weak electric field a few centimetres
+             into the air. A hand entering the field distorts it, and the MGC3130
+             chip resolves that distortion into a continuous 3D position —
+             in any lighting.</p>
+        </div>
+        <div class="reveal" style="transition-delay: 0.08s">
+          <h3><span>FILTERING</span>Noise in. Lines out.</h3>
+          <p>The pipeline calibrates the usable field range, removes spikes with a
+             median window and spike gate, then smooths the path with a One-Euro
+             filter. Height hysteresis turns hand raises into clean pen-up and
+             pen-down events.</p>
+        </div>
+        <div class="reveal" style="transition-delay: 0.16s">
+          <h3><span>REIMAGINING</span>Sketch to artwork.</h3>
+          <p>A finished drawing is rendered to a clean sketch and sent to a vision
+             language model, which names it and prompts an image generator. Seconds
+             later, your air-drawing returns as a finished illustration.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap">
+      <span>Copyright © 2026 Airdraw. An interactive exhibition piece.</span>
+      <a href="https://github.com/ChengJu1/Airdraw">Source on GitHub</a>
+    </div>
+  </footer>
+
+  <script>
+    // ---------- display animation: an invisible pen wandering in the air ----------
+    const cv = document.getElementById('sky');
+    const ctx = cv.getContext('2d');
+    const palette = ['#78c8ff', '#8cebbe', '#fac878', '#d2a0ff', '#ff96a5', '#f0f2f8'];
+
+    let w, h, x, y, vx, vy, hue = 0, penDown = true, timer = 0;
+
+    function resize() {
+      w = cv.width = cv.offsetWidth * devicePixelRatio;
+      h = cv.height = cv.offsetHeight * devicePixelRatio;
+      x = w / 2; y = h / 2;
+      vx = 1.2; vy = 0.6;
+      ctx.fillStyle = '#0a0c12';
+      ctx.fillRect(0, 0, w, h);
+    }
+    resize();
+    addEventListener('resize', resize);
+
+    function tick() {
+      // translucent wash so old strokes fade slowly
+      ctx.fillStyle = 'rgba(10, 12, 18, 0.02)';
+      ctx.fillRect(0, 0, w, h);
+
+      // wander: slow turns plus a little noise, like a hand in the air
+      const turn = (Math.random() - 0.5) * 0.5;
+      const speed = Math.hypot(vx, vy);
+      const ang = Math.atan2(vy, vx) + turn;
+      const s = Math.min(3.2, Math.max(1.0, speed + (Math.random() - 0.5) * 0.3)) * devicePixelRatio;
+      vx = Math.cos(ang) * s;
+      vy = Math.sin(ang) * s;
+
+      const nx = x + vx, ny = y + vy;
+
+      if (penDown) {
+        ctx.strokeStyle = palette[hue];
+        ctx.lineWidth = 2.2 * devicePixelRatio;
+        ctx.lineCap = 'round';
+        ctx.shadowColor = palette[hue];
+        ctx.shadowBlur = 10 * devicePixelRatio;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(nx, ny);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+
+      x = nx; y = ny;
+
+      // out of bounds: lift the pen and re-enter elsewhere
+      const m = 60 * devicePixelRatio;
+      if (x < m || x > w - m || y < m || y > h - m) {
+        x = w * (0.3 + Math.random() * 0.4);
+        y = h * (0.3 + Math.random() * 0.4);
+        hue = (hue + 1) % palette.length;
+      }
+
+      // occasionally lift the pen for a beat, then start a new stroke
+      if (--timer <= 0) {
+        penDown = !penDown;
+        timer = penDown ? 220 + Math.random() * 260 : 12 + Math.random() * 20;
+        if (penDown) hue = (hue + 1) % palette.length;
+      }
+
+      requestAnimationFrame(tick);
+    }
+    tick();
+
+    // ---------- scroll reveal ----------
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) {
+          e.target.classList.add('in');
+          io.unobserve(e.target);
+        }
+      }
+    }, { threshold: 0.15 });
+    document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+  </script>
+
+</body>
+</html>

@@ -1,12 +1,16 @@
-# Skywriter trajectory preprocessing (denoise + extract)
+# Airdraw
 
-**First stage** of the final-year project pipeline: take air-drawn trajectories captured by the Skywriter (MGC3130), apply **denoising** and **extraction**, and output normalized strokes plus the **stroke-3** format required by Sketch-RNN for the later reconstruction stage.
+Air-drawn sketch capture with the Skywriter (MGC3130), trajectory preprocessing, and AI reconstruction. Includes a browser demo (`index.html`), a Raspberry Pi exhibition app (`draw_app.py`), and an offline processing pipeline.
 
 ```
-raw (t, x, y, z) → pen up/down detection → denoise → segment/resample/normalize → stroke-3
+raw (t, x, y, z) → pen up/down detection → denoise → segment/resample/normalize → stroke-3 → LLM reconstruction
 ```
 
-## Modules
+## Web demo
+
+Open `index.html` in a browser, or see `demo.mp4` and the `samples/` folder for example sketch-to-art outputs.
+
+## Pipeline modules
 
 | File | Purpose |
 |------|------|
@@ -18,6 +22,9 @@ raw (t, x, y, z) → pen up/down detection → denoise → segment/resample/norm
 | `demo.py`       | Run the full pipeline on synthetic data, or load a real CSV |
 | `rt_filters.py` | Real-time filter chain (median / spike gate / 1€ / z hysteresis pen up/down), shared by the Raspberry Pi and the offline side |
 | `mgc3130.py`    | MGC3130 sensor I2C reader, shared by the three Raspberry Pi scripts (copy along with the scripts when deploying) |
+| `draw_app.py`     | Fullscreen Pygame exhibition app on the Pi |
+| `web_capture.py`  | Flask app for live drawing in a browser |
+| `reconstruct_llm.py`| LLM recognition + text-to-image reconstruction demo |
 
 ## Pen up/down scheme
 
@@ -52,4 +59,4 @@ Outputs:
 
 ## Next step
 
-The stroke-3 sequence will be fed into Sketch-RNN for the **denoising reconstruction** stage (second stage of the pipeline).
+The stroke-3 sequence is fed into Sketch-RNN or an LLM pipeline for the **reconstruction** stage.
